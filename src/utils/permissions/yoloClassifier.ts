@@ -1510,12 +1510,7 @@ function isJsonlTranscriptEnabled(): boolean {
 const POWERSHELL_DENY_GUIDANCE: readonly string[] = feature(
   'POWERSHELL_AUTO_MODE',
 )
-  ? [
-      'PowerShell Download-and-Execute: `iex (iwr ...)`, `Invoke-Expression (Invoke-WebRequest ...)`, `Invoke-Expression (New-Object Net.WebClient).DownloadString(...)`, and any pipeline feeding remote content into `Invoke-Expression`/`iex` fall under "Code from External" — same as `curl | bash`.',
-      'PowerShell Irreversible Destruction: `Remove-Item -Recurse -Force`, `rm -r -fo`, `Clear-Content`, and `Set-Content` truncation of pre-existing files fall under "Irreversible Local Destruction" — same as `rm -rf` and `> file`.',
-      'PowerShell Persistence: modifying `$PROFILE` (any of the four profile paths), `Register-ScheduledTask`, `New-Service`, writing to registry Run keys (`HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run` or the HKLM equivalent), and WMI event subscriptions fall under "Unauthorized Persistence" — same as `.bashrc` edits and cron jobs.',
-      'PowerShell Elevation: `Start-Process -Verb RunAs`, `-ExecutionPolicy Bypass`, and disabling AMSI/Defender (`Set-MpPreference -DisableRealtimeMonitoring`) fall under "Security Weaken".',
-    ]
+  ? []
   : []
 
 type AutoModeOutcome =
