@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.15.0](https://github.com/Gitlawb/openclaude/compare/v0.14.0...v0.15.0) (2026-05-25)
+
+
+### Features
+
+* configure API retry backoff ([#370](https://github.com/Gitlawb/openclaude/issues/370)) ([#1095](https://github.com/Gitlawb/openclaude/issues/1095)) ([d02c10b](https://github.com/Gitlawb/openclaude/commit/d02c10b399a9e30a7018646ad0c24d14f35bff13))
+* **query:** robust multi-lingual and structural continuation nudge ([#1280](https://github.com/Gitlawb/openclaude/issues/1280)) ([2f8aa50](https://github.com/Gitlawb/openclaude/commit/2f8aa50cf6f87e3c64f7cf3cc07a351a22f7f950))
+* **safety:** warn at startup when 3P provider + permissive mode skip the AI classifier ([#1260](https://github.com/Gitlawb/openclaude/issues/1260)) ([4e8fa24](https://github.com/Gitlawb/openclaude/commit/4e8fa24cce5de07052632d5a8a7fb4474217eab8))
+
+
+### Bug Fixes
+
+* **codex-stream:** recover tool args delivered only via done events ([#1262](https://github.com/Gitlawb/openclaude/issues/1262)) ([2d26a46](https://github.com/Gitlawb/openclaude/commit/2d26a4673a565301a3ee00e33e26059f37b7d44a)), closes [#1259](https://github.com/Gitlawb/openclaude/issues/1259)
+* **json-schema:** support top-level non-object roots via wrap/unwrap ([#1261](https://github.com/Gitlawb/openclaude/issues/1261)) ([07d9b4f](https://github.com/Gitlawb/openclaude/commit/07d9b4fec49dcbae67ac721ac581f4e1b3c6a4fb)), closes [#1256](https://github.com/Gitlawb/openclaude/issues/1256)
+* route MiniMax compacting through Anthropic-compatible API ([#1154](https://github.com/Gitlawb/openclaude/issues/1154)) ([b3dc674](https://github.com/Gitlawb/openclaude/commit/b3dc674dbea8e1a740832fdde54d8fd820d501bd))
+
 ## [0.14.0](https://github.com/Gitlawb/openclaude/compare/v0.13.0...v0.14.0) (2026-05-23)
 
 
