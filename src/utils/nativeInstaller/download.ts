@@ -589,7 +589,7 @@ export async function downloadVersionFromGitHubRelease(
   const manifestUrl = `${GITHUB_RELEASE_DOWNLOAD_BASE_URL}/${tag}/manifest.json`
   try {
     const manifestResponse = await axios.get(manifestUrl, {
-      timeout: 10000,
+      timeout: 30000,
       responseType: 'json',
     })
     manifest = manifestResponse.data

@@ -161,6 +161,59 @@ test('external binary downloads GitHub Release asset and stages canonical execut
   ])
 })
 
+test('external GitHub Release manifest fetch allows slow connections', async () => {
+  mockInstaller('win32-x64')
+  const payload = Buffer.from('native openclaude windows binary')
+  const requests: { url: string; timeout?: unknown }[] = []
+
+  mock.module('axios', () => {
+    const axios = {
+      get: async (url: string, config: { timeout?: number } = {}) => {
+        requests.push({ url, timeout: config.timeout })
+        if (
+          url ===
+          'https://github.com/AndersonBY/openclaude/releases/download/v0.14.4/manifest.json'
+        ) {
+          return {
+            data: {
+              platforms: {
+                'win32-x64': {
+                  checksum: sha256(payload),
+                  asset: 'openclaude-win32-x64.exe',
+                },
+              },
+            },
+          }
+        }
+
+        if (
+          url ===
+          'https://github.com/AndersonBY/openclaude/releases/download/v0.14.4/openclaude-win32-x64.exe'
+        ) {
+          return { data: payload }
+        }
+
+        throw new Error(`Unexpected URL: ${url}`)
+      },
+      isAxiosError: () => false,
+      isCancel: () => false,
+    }
+    return { default: axios }
+  })
+  const stagingPath = join(
+    tmpdir(),
+    `openclaude-download-timeout-test-${Date.now()}-${Math.random()}`,
+  )
+  tempDirs.push(stagingPath)
+
+  const { downloadVersion } = await importFreshDownload()
+
+  await expect(downloadVersion('0.14.4', stagingPath)).resolves.toBe('binary')
+  expect(
+    requests.find(request => request.url.endsWith('/manifest.json'))?.timeout,
+  ).toBeGreaterThanOrEqual(30000)
+})
+
 test('external binary reports missing GitHub Release platform clearly', async () => {
   mockInstaller('darwin-arm64')
   mockAxiosGet(url => {
