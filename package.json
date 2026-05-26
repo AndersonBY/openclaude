@@ -1,6 +1,6 @@
 {
   "name": "@makerbi/openclaude",
-  "version": "0.14.1",
+  "version": "0.14.2",
   "description": "OpenClaude opens coding-agent workflows to any LLM — OpenAI, Gemini, DeepSeek, Ollama, and 200+ models",
   "type": "module",
   "bin": {
@@ -148,7 +148,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Gitlawb/openclaude.git"
+    "url": "https://github.com/AndersonBY/openclaude.git"
   },
   "keywords": [
     "claude-code",
