@@ -29,8 +29,8 @@ import {
 } from './shellConfig.js'
 import { jsonParse } from './slowOperations.js'
 
-const GCS_BUCKET_URL =
-  'https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases'
+const GITHUB_RELEASES_API_URL =
+  'https://api.github.com/repos/AndersonBY/openclaude/releases'
 
 class AutoUpdaterError extends ClaudeError {}
 
@@ -403,37 +403,71 @@ export async function getNpmDistTags(): Promise<NpmDistTags> {
   }
 }
 
+function normalizeReleaseVersion(tagName: string): string {
+  return tagName.startsWith('v') ? tagName.slice(1) : tagName
+}
+
+function isReleaseVersion(value: unknown): value is string {
+  return typeof value === 'string' && /^v?\d+\.\d+\.\d+(-\S+)?$/.test(value)
+}
+
 /**
- * Get the latest version from GCS bucket for a given release channel.
+ * Get the latest version from AndersonBY GitHub Releases for a given release channel.
  * This is used by installations that don't have npm (e.g. package manager installs).
  */
-export async function getLatestVersionFromGcs(
+export async function getLatestVersionFromGitHubReleases(
   channel: ReleaseChannel,
 ): Promise<string | null> {
   try {
-    const response = await axios.get(`${GCS_BUCKET_URL}/${channel}`, {
+    if (channel === 'latest') {
+      const response = await axios.get(`${GITHUB_RELEASES_API_URL}/latest`, {
+        timeout: 5000,
+        responseType: 'json',
+      })
+      const tagName = response.data?.tag_name
+      return isReleaseVersion(tagName) ? normalizeReleaseVersion(tagName) : null
+    }
+
+    const response = await axios.get(`${GITHUB_RELEASES_API_URL}?per_page=20`, {
       timeout: 5000,
-      responseType: 'text',
+      responseType: 'json',
     })
-    return response.data.trim()
+    const stableRelease = Array.isArray(response.data)
+      ? response.data.find(
+          release =>
+            release &&
+            !release.draft &&
+            !release.prerelease &&
+            isReleaseVersion(release.tag_name),
+        )
+      : null
+    return stableRelease
+      ? normalizeReleaseVersion(stableRelease.tag_name)
+      : null
   } catch (error) {
-    logForDebugging(`Failed to fetch ${channel} from GCS: ${error}`)
+    logForDebugging(
+      `Failed to fetch ${channel} from GitHub Releases: ${error}`,
+    )
     return null
   }
 }
 
+export const getLatestVersionFromGcs = getLatestVersionFromGitHubReleases
+
 /**
- * Get available versions from GCS bucket (for native installations).
+ * Get available versions from GitHub Releases (for native installations).
  * Fetches both latest and stable channel pointers.
  */
-export async function getGcsDistTags(): Promise<NpmDistTags> {
+export async function getGitHubReleaseDistTags(): Promise<NpmDistTags> {
   const [latest, stable] = await Promise.all([
-    getLatestVersionFromGcs('latest'),
-    getLatestVersionFromGcs('stable'),
+    getLatestVersionFromGitHubReleases('latest'),
+    getLatestVersionFromGitHubReleases('stable'),
   ])
 
   return { latest, stable }
 }
+
+export const getGcsDistTags = getGitHubReleaseDistTags
 
 /**
  * Get version history from npm registry (internal-only feature)

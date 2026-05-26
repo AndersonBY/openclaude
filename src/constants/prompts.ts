@@ -99,7 +99,7 @@ const skillSearchFeatureCheck = feature('EXPERIMENTAL_SKILL_SEARCH')
 import type { OutputStyleConfig } from './outputStyles.js'
 
 export const CLAUDE_CODE_DOCS_MAP_URL =
-  'https://github.com/Gitlawb/openclaude'
+  'https://github.com/AndersonBY/openclaude'
 
 /**
  * Boundary marker separating static (cross-org cacheable) content from dynamic content.

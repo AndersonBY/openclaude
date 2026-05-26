@@ -133,7 +133,7 @@ export function getAttributionTexts(): AttributionTexts {
     isInternalRepo: isInternalModelRepoCached(),
   })
   const defaultAttribution =
-    '🤖 Generated with [OpenClaude](https://github.com/Gitlawb/openclaude)'
+    '🤖 Generated with [OpenClaude](https://github.com/AndersonBY/openclaude)'
   const coAuthorEmail = getDefaultCommitCoAuthorEmail(apiProvider)
   const defaultCommit = isEnvTruthy(
     process.env.OPENCLAUDE_DISABLE_CO_AUTHORED_BY,
@@ -388,7 +388,7 @@ export async function getEnhancedPRAttribution(
   }
 
   const defaultAttribution =
-    '🤖 Generated with [OpenClaude](https://github.com/Gitlawb/openclaude)'
+    '🤖 Generated with [OpenClaude](https://github.com/AndersonBY/openclaude)'
 
   // Get AppState first
   const appState = getAppState()
@@ -434,7 +434,7 @@ export async function getEnhancedPRAttribution(
     memoryAccessCount > 0
       ? `, ${memoryAccessCount} ${memoryAccessCount === 1 ? 'memory' : 'memories'} recalled`
       : ''
-  const summary = `🤖 Generated with [OpenClaude](https://github.com/Gitlawb/openclaude) (${claudePercent}% ${promptCount}-shotted by ${shortModelName}${memSuffix})`
+  const summary = `🤖 Generated with [OpenClaude](https://github.com/AndersonBY/openclaude) (${claudePercent}% ${promptCount}-shotted by ${shortModelName}${memSuffix})`
 
   // Append trailer lines for squash-merge survival. Only for allowlisted repos
   // (INTERNAL_MODEL_REPOS) and only in builds with COMMIT_ATTRIBUTION enabled —

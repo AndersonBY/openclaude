@@ -1,6 +1,6 @@
 {
   "name": "@makerbi/openclaude",
-  "version": "0.14.2",
+  "version": "0.14.3",
   "description": "OpenClaude opens coding-agent workflows to any LLM — OpenAI, Gemini, DeepSeek, Ollama, and 200+ models",
   "type": "module",
   "bin": {
@@ -24,6 +24,7 @@
   ],
   "scripts": {
     "build": "bun run scripts/build.ts",
+    "build:native:manifest": "bun run scripts/native-release-manifest.ts native-dist",
     "integrations:generate": "bun run scripts/generate-integrations-artifacts.ts",
     "integrations:check": "bun run scripts/generate-integrations-artifacts.ts --check",
     "dev": "bun run build && node dist/cli.mjs",

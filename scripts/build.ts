@@ -14,6 +14,9 @@ import { CLI_EXTERNALS, SDK_EXTERNALS } from './externals.js'
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'))
 const version = pkg.version
+const packageUrl = '@makerbi/openclaude'
+const repositoryUrl = 'https://github.com/AndersonBY/openclaude'
+const issuesUrl = `${repositoryUrl}/issues`
 
 // Feature flags for the open build.
 // Most Anthropic-internal features stay off; open-build features can be
@@ -129,10 +132,10 @@ result = await Bun.build({
     'MACRO.DISPLAY_VERSION': JSON.stringify(version),
     'MACRO.BUILD_TIME': JSON.stringify(new Date().toISOString()),
     'MACRO.ISSUES_EXPLAINER':
-      JSON.stringify('report the issue at https://github.com/Gitlawb/openclaude/issues'),
+      JSON.stringify(`report the issue at ${issuesUrl}`),
     'MACRO.FEEDBACK_CHANNEL':
-      JSON.stringify('https://github.com/Gitlawb/openclaude/issues'),
-    'MACRO.PACKAGE_URL': JSON.stringify('@gitlawb/openclaude'),
+      JSON.stringify(issuesUrl),
+    'MACRO.PACKAGE_URL': JSON.stringify(packageUrl),
     'MACRO.NATIVE_PACKAGE_URL': 'undefined',
   },
   plugins: [
@@ -434,10 +437,10 @@ sdkResult = await Bun.build({
     'MACRO.DISPLAY_VERSION': JSON.stringify(version),
     'MACRO.BUILD_TIME': JSON.stringify(new Date().toISOString()),
     'MACRO.ISSUES_EXPLAINER':
-      JSON.stringify('report the issue at https://github.com/Gitlawb/openclaude/issues'),
+      JSON.stringify(`report the issue at ${issuesUrl}`),
     'MACRO.FEEDBACK_CHANNEL':
-      JSON.stringify('https://github.com/Gitlawb/openclaude/issues'),
-    'MACRO.PACKAGE_URL': JSON.stringify('@gitlawb/openclaude'),
+      JSON.stringify(issuesUrl),
+    'MACRO.PACKAGE_URL': JSON.stringify(packageUrl),
     'MACRO.NATIVE_PACKAGE_URL': 'undefined',
   },
   // External: everything TUI-related + native modules

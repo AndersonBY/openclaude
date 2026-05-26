@@ -4,6 +4,7 @@
  * Handles downloading Claude binaries from various sources:
  * - Artifactory NPM packages
  * - GCS bucket
+ * - GitHub Releases
  */
 
 import { feature } from 'bun:bundle'
@@ -24,8 +25,30 @@ import { getBinaryName, getPlatform } from './installer.js'
 
 const GCS_BUCKET_URL =
   'https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases'
+const GITHUB_RELEASES_API_URL =
+  'https://api.github.com/repos/AndersonBY/openclaude/releases'
+const GITHUB_RELEASE_DOWNLOAD_BASE_URL =
+  'https://github.com/AndersonBY/openclaude/releases/download'
 export const ARTIFACTORY_REGISTRY_URL =
   process.env.CLAUDE_CODE_INTERNAL_ARTIFACTORY_REGISTRY_URL ?? ''
+
+function normalizeReleaseTag(version: string): string {
+  return version.startsWith('v') ? version : `v${version}`
+}
+
+function normalizeReleaseVersion(tagName: string): string {
+  return tagName.startsWith('v') ? tagName.slice(1) : tagName
+}
+
+function getGitHubReleaseAssetName(platform: string): string {
+  return platform.startsWith('win32')
+    ? `claude-${platform}.exe`
+    : `claude-${platform}`
+}
+
+function isReleaseVersion(value: unknown): value is string {
+  return typeof value === 'string' && /^v?\d+\.\d+\.\d+(-\S+)?$/.test(value)
+}
 
 export async function getLatestVersionFromArtifactory(
   tag: string = 'latest',
@@ -112,6 +135,64 @@ export async function getLatestVersionFromBinaryRepo(
   }
 }
 
+export async function getLatestVersionFromGitHubReleases(
+  channel: ReleaseChannel = 'latest',
+): Promise<string> {
+  const startTime = Date.now()
+  const releaseUrl =
+    channel === 'latest'
+      ? `${GITHUB_RELEASES_API_URL}/latest`
+      : `${GITHUB_RELEASES_API_URL}?per_page=20`
+  try {
+    const response = await axios.get(releaseUrl, {
+      timeout: 30000,
+      responseType: 'json',
+    })
+    const latencyMs = Date.now() - startTime
+    const tagName =
+      channel === 'latest'
+        ? response.data?.tag_name
+        : Array.isArray(response.data)
+          ? response.data.find(
+              release =>
+                release &&
+                !release.draft &&
+                !release.prerelease &&
+                isReleaseVersion(release.tag_name),
+            )?.tag_name
+          : null
+
+    if (!isReleaseVersion(tagName)) {
+      throw new Error(
+        `GitHub ${channel} release response did not include a valid tag_name`,
+      )
+    }
+
+    logEvent('tengu_version_check_success', {
+      latency_ms: latencyMs,
+    })
+    return normalizeReleaseVersion(tagName.trim())
+  } catch (error) {
+    const latencyMs = Date.now() - startTime
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    let httpStatus: number | undefined
+    if (axios.isAxiosError(error) && error.response) {
+      httpStatus = error.response.status
+    }
+
+    logEvent('tengu_version_check_failure', {
+      latency_ms: latencyMs,
+      http_status: httpStatus,
+      is_timeout: errorMessage.includes('timeout'),
+    })
+    const fetchError = new Error(
+      `Failed to fetch ${channel} GitHub release from ${releaseUrl}: ${errorMessage}`,
+    )
+    logError(fetchError)
+    throw fetchError
+  }
+}
+
 export async function getLatestVersion(
   channelOrVersion: string,
 ): Promise<string> {
@@ -147,8 +228,8 @@ export async function getLatestVersion(
     return getLatestVersionFromArtifactory(npmTag)
   }
 
-  // Use GCS for external users
-  return getLatestVersionFromBinaryRepo(channel, GCS_BUCKET_URL)
+  // Use AndersonBY GitHub Releases for external users.
+  return getLatestVersionFromGitHubReleases(channel)
 }
 
 export async function downloadVersionFromArtifactory(
@@ -490,6 +571,91 @@ export async function downloadVersionFromBinaryRepo(
   }
 }
 
+export async function downloadVersionFromGitHubRelease(
+  version: string,
+  stagingPath: string,
+) {
+  const fs = getFsImplementation()
+
+  await fs.rm(stagingPath, { recursive: true, force: true })
+
+  const platform = getPlatform()
+  const tag = normalizeReleaseTag(version)
+  const startTime = Date.now()
+
+  logEvent('tengu_binary_download_attempt', {})
+
+  let manifest
+  const manifestUrl = `${GITHUB_RELEASE_DOWNLOAD_BASE_URL}/${tag}/manifest.json`
+  try {
+    const manifestResponse = await axios.get(manifestUrl, {
+      timeout: 10000,
+      responseType: 'json',
+    })
+    manifest = manifestResponse.data
+  } catch (error) {
+    const latencyMs = Date.now() - startTime
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    let httpStatus: number | undefined
+    if (axios.isAxiosError(error) && error.response) {
+      httpStatus = error.response.status
+    }
+
+    logEvent('tengu_binary_manifest_fetch_failure', {
+      latency_ms: latencyMs,
+      http_status: httpStatus,
+      is_timeout: errorMessage.includes('timeout'),
+    })
+    logError(
+      new Error(`Failed to fetch manifest from ${manifestUrl}: ${errorMessage}`),
+    )
+    throw error
+  }
+
+  const platformInfo = manifest.platforms[platform]
+
+  if (!platformInfo) {
+    logEvent('tengu_binary_platform_not_found', {})
+    throw new Error(
+      `Platform ${platform} not found in manifest for version ${version}`,
+    )
+  }
+
+  const expectedChecksum = platformInfo.checksum
+  const assetName = platformInfo.asset ?? getGitHubReleaseAssetName(platform)
+  const binaryUrl = `${GITHUB_RELEASE_DOWNLOAD_BASE_URL}/${tag}/${encodeURIComponent(assetName)}`
+  const binaryName = getBinaryName(platform)
+
+  await fs.mkdir(stagingPath)
+  const binaryPath = join(stagingPath, binaryName)
+
+  try {
+    await downloadAndVerifyBinary(binaryUrl, expectedChecksum, binaryPath)
+    const latencyMs = Date.now() - startTime
+    logEvent('tengu_binary_download_success', {
+      latency_ms: latencyMs,
+    })
+  } catch (error) {
+    const latencyMs = Date.now() - startTime
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    let httpStatus: number | undefined
+    if (axios.isAxiosError(error) && error.response) {
+      httpStatus = error.response.status
+    }
+
+    logEvent('tengu_binary_download_failure', {
+      latency_ms: latencyMs,
+      http_status: httpStatus,
+      is_timeout: errorMessage.includes('timeout'),
+      is_checksum_mismatch: errorMessage.includes('Checksum mismatch'),
+    })
+    logError(
+      new Error(`Failed to download binary from ${binaryUrl}: ${errorMessage}`),
+    )
+    throw error
+  }
+}
+
 export async function downloadVersion(
   version: string,
   stagingPath: string,
@@ -518,8 +684,8 @@ export async function downloadVersion(
     return 'npm'
   }
 
-  // Use GCS for external users
-  await downloadVersionFromBinaryRepo(version, stagingPath, GCS_BUCKET_URL)
+  // Use AndersonBY GitHub Releases for external users.
+  await downloadVersionFromGitHubRelease(version, stagingPath)
   return 'binary'
 }
 

@@ -34,6 +34,7 @@ export async function checkGlobalInstallPermissions() { return { hasPermissions:
 export async function getLatestVersion() { return null; }
 export async function getNpmDistTags() { return { latest: null, stable: null }; }
 export async function getLatestVersionFromGcs() { return null; }
+export async function getLatestVersionFromGitHubReleases() { return null; }
 export async function getGcsDistTags() { return { latest: null, stable: null }; }
 export async function getVersionHistory() { return []; }
 export async function installGlobalPackage() { return 'success'; }
