@@ -92,6 +92,39 @@ test('external latest resolves from AndersonBY GitHub Releases', async () => {
   ])
 })
 
+test('external latest falls back to GitHub release redirect when API is rate limited', async () => {
+  const curlCalls: string[][] = []
+  mockAxiosGet(url => {
+    expect(url).toBe(
+      'https://api.github.com/repos/AndersonBY/openclaude/releases/latest',
+    )
+    const error = new Error('Request failed with status code 403')
+    ;(error as Error & { response?: { status: number } }).response = {
+      status: 403,
+    }
+    throw error
+  })
+
+  mock.module('../execFileNoThrow.js', () => ({
+    execFileNoThrowWithCwd: async (command: string, args: string[]) => {
+      curlCalls.push([command, ...args])
+      return {
+        code: 0,
+        stderr: '',
+        stdout: 'https://github.com/AndersonBY/openclaude/releases/tag/v0.14.8',
+      }
+    },
+  }))
+
+  const { getLatestVersion } = await importFreshDownload()
+
+  await expect(getLatestVersion('latest')).resolves.toBe('0.14.8')
+  expect(curlCalls).toHaveLength(1)
+  expect(curlCalls[0]?.join(' ')).toContain(
+    'https://github.com/AndersonBY/openclaude/releases/latest',
+  )
+})
+
 test('external stable resolves first non-prerelease AndersonBY GitHub Release', async () => {
   mockInstaller()
   const calls = mockAxiosGet(url => {

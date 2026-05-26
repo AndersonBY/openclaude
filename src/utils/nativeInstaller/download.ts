@@ -27,6 +27,8 @@ const GCS_BUCKET_URL =
   'https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases'
 const GITHUB_RELEASES_API_URL =
   'https://api.github.com/repos/AndersonBY/openclaude/releases'
+const GITHUB_RELEASES_WEB_URL =
+  'https://github.com/AndersonBY/openclaude/releases'
 const GITHUB_RELEASE_DOWNLOAD_BASE_URL =
   'https://github.com/AndersonBY/openclaude/releases/download'
 export const ARTIFACTORY_REGISTRY_URL =
@@ -50,6 +52,15 @@ function getCurlExecutable(): string {
   return process.platform === 'win32' ? 'curl.exe' : 'curl'
 }
 
+function getNullOutputPath(): string {
+  return process.platform === 'win32' ? 'NUL' : '/dev/null'
+}
+
+function parseReleaseVersionFromUrl(url: string): string | null {
+  const match = url.trim().match(/\/releases\/tag\/(v?\d+\.\d+\.\d+(?:-\S+)?)$/)
+  return match ? normalizeReleaseVersion(match[1]!) : null
+}
+
 function shouldFallbackToCurl(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
   if (axios.isAxiosError(error)) {
@@ -58,6 +69,43 @@ function shouldFallbackToCurl(error: unknown): boolean {
   return /EAI_AGAIN|ECONNRESET|ETIMEDOUT|ENOTFOUND|network|timeout/i.test(
     message,
   )
+}
+
+async function getLatestVersionFromGitHubLatestRedirect(): Promise<
+  string | null
+> {
+  const latestUrl = `${GITHUB_RELEASES_WEB_URL}/latest`
+  const { stdout, stderr, code, error } = await execFileNoThrowWithCwd(
+    getCurlExecutable(),
+    [
+      '-L',
+      '--silent',
+      '--show-error',
+      '--max-time',
+      '30',
+      '--output',
+      getNullOutputPath(),
+      '--write-out',
+      '%{url_effective}',
+      latestUrl,
+    ],
+    {
+      timeout: 35000,
+      preserveOutputOnError: true,
+    },
+  )
+
+  if (code !== 0) {
+    logForDebugging(
+      `GitHub latest redirect fallback failed: ${
+        error || stderr || `curl exited with code ${code}`
+      }`,
+      { level: 'warn' },
+    )
+    return null
+  }
+
+  return parseReleaseVersionFromUrl(stdout)
 }
 
 async function fetchJsonWithCurl(url: string, timeoutMs: number) {
@@ -257,6 +305,17 @@ export async function getLatestVersionFromGitHubReleases(
     })
     return normalizeReleaseVersion(tagName.trim())
   } catch (error) {
+    if (channel === 'latest') {
+      const fallbackVersion = await getLatestVersionFromGitHubLatestRedirect()
+      if (fallbackVersion) {
+        logForDebugging(
+          `Resolved latest GitHub release via redirect fallback: ${fallbackVersion}`,
+          { level: 'warn' },
+        )
+        return fallbackVersion
+      }
+    }
+
     const latencyMs = Date.now() - startTime
     const errorMessage = error instanceof Error ? error.message : String(error)
     let httpStatus: number | undefined
