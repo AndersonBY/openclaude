@@ -68,3 +68,28 @@ describe('native release manifest', () => {
     )
   })
 })
+
+describe('native release workflow', () => {
+  test('does not externalize runtime SDK dependencies from standalone binaries', async () => {
+    const workflow = await readFile(
+      join(import.meta.dir, '..', '.github', 'workflows', 'npm-publish.yml'),
+      'utf-8',
+    )
+
+    for (const dependency of [
+      '@aws-sdk/client-bedrock',
+      '@aws-sdk/client-bedrock-runtime',
+      '@aws-sdk/client-sts',
+      '@aws-sdk/credential-providers',
+      '@aws-sdk/credential-provider-node',
+      '@smithy/node-http-handler',
+      '@smithy/core',
+      '@azure/identity',
+      'google-auth-library',
+      '@orama/orama',
+      '@orama/plugin-data-persistence',
+    ]) {
+      expect(workflow).not.toContain(`--external=${dependency}`)
+    }
+  })
+})

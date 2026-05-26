@@ -68,18 +68,7 @@ jobs:
             --target=bun
             --compile-autoload-package-json
             --external=sharp
-            --external=@aws-sdk/client-bedrock
-            --external=@aws-sdk/client-bedrock-runtime
-            --external=@aws-sdk/client-sts
-            --external=@aws-sdk/credential-providers
-            --external=@aws-sdk/credential-provider-node
-            --external=@smithy/node-http-handler
-            --external=@smithy/core
-            --external=@azure/identity
-            --external=google-auth-library
             --external=@vscode/ripgrep
-            --external=@orama/orama
-            --external=@orama/plugin-data-persistence
             --outfile="native-dist/${{ matrix.output }}"
             dist/cli.mjs
           )
