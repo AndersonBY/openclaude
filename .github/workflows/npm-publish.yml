@@ -1,0 +1,80 @@
+name: Publish npm Package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    environment: npm-publish
+
+    steps:
+      - name: Check out tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build package
+        run: bun run build
+
+      - name: Smoke test
+        run: node dist/cli.mjs --version
+
+      - name: Verify package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_NAME="$(node -p "require('./package.json').name")"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+
+          if [[ "$PACKAGE_NAME" != "@makerbi/openclaude" ]]; then
+            echo "Expected package name @makerbi/openclaude, got $PACKAGE_NAME" >&2
+            exit 1
+          fi
+
+          if [[ "$PACKAGE_VERSION" != "$TAG_VERSION" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Dry-run package
+        run: npm pack --dry-run
+
+      - name: Publish to npm
+        run: npm publish --access public
+
+      - name: Release summary
+        shell: bash
+        run: |
+          {
+            echo "## Published $GITHUB_REF_NAME"
+            echo
+            echo "- npm: https://www.npmjs.com/package/@makerbi/openclaude/v/${GITHUB_REF_NAME#v}"
+            echo "- repository: https://github.com/${GITHUB_REPOSITORY}"
+          } >> "$GITHUB_STEP_SUMMARY"
