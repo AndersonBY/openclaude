@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
-import { readFile, rm } from 'fs/promises'
+import { readFile, rm, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createHash } from 'crypto'
@@ -212,6 +212,130 @@ test('external GitHub Release manifest fetch allows slow connections', async () 
   expect(
     requests.find(request => request.url.endsWith('/manifest.json'))?.timeout,
   ).toBeGreaterThanOrEqual(30000)
+})
+
+test('external GitHub Release manifest fetch falls back to curl after network failure', async () => {
+  mockInstaller('win32-x64')
+  const payload = Buffer.from('native openclaude windows binary')
+  const curlCalls: string[][] = []
+
+  mockAxiosGet(url => {
+    if (
+      url ===
+      'https://github.com/AndersonBY/openclaude/releases/download/v0.14.7/manifest.json'
+    ) {
+      throw new Error('connect ETIMEDOUT 198.18.5.9:443')
+    }
+
+    if (
+      url ===
+      'https://github.com/AndersonBY/openclaude/releases/download/v0.14.7/openclaude-win32-x64.exe'
+    ) {
+      return { data: payload }
+    }
+
+    throw new Error(`Unexpected URL: ${url}`)
+  })
+
+  mock.module('../execFileNoThrow.js', () => ({
+    execFileNoThrowWithCwd: async (command: string, args: string[]) => {
+      curlCalls.push([command, ...args])
+      return {
+        code: 0,
+        stderr: '',
+        stdout: JSON.stringify({
+          platforms: {
+            'win32-x64': {
+              checksum: sha256(payload),
+              asset: 'openclaude-win32-x64.exe',
+            },
+          },
+        }),
+      }
+    },
+  }))
+
+  const stagingPath = join(
+    tmpdir(),
+    `openclaude-download-curl-test-${Date.now()}-${Math.random()}`,
+  )
+  tempDirs.push(stagingPath)
+
+  const { downloadVersion } = await importFreshDownload()
+
+  await expect(downloadVersion('0.14.7', stagingPath)).resolves.toBe('binary')
+  await expect(readFile(join(stagingPath, 'openclaude.exe'))).resolves.toEqual(
+    payload,
+  )
+  expect(curlCalls).toHaveLength(1)
+  expect(curlCalls[0]?.join(' ')).toContain(
+    'https://github.com/AndersonBY/openclaude/releases/download/v0.14.7/manifest.json',
+  )
+})
+
+test('external GitHub Release binary download falls back to curl after network failure', async () => {
+  mockInstaller('win32-x64')
+  const payload = Buffer.from('native openclaude windows binary')
+  const curlCalls: string[][] = []
+
+  mockAxiosGet(url => {
+    if (
+      url ===
+      'https://github.com/AndersonBY/openclaude/releases/download/v0.14.7/manifest.json'
+    ) {
+      return {
+        data: {
+          platforms: {
+            'win32-x64': {
+              checksum: sha256(payload),
+              asset: 'openclaude-win32-x64.exe',
+            },
+          },
+        },
+      }
+    }
+
+    if (
+      url ===
+      'https://github.com/AndersonBY/openclaude/releases/download/v0.14.7/openclaude-win32-x64.exe'
+    ) {
+      throw new Error('connect ETIMEDOUT 198.18.5.9:443')
+    }
+
+    throw new Error(`Unexpected URL: ${url}`)
+  })
+
+  mock.module('../execFileNoThrow.js', () => ({
+    execFileNoThrowWithCwd: async (command: string, args: string[]) => {
+      curlCalls.push([command, ...args])
+      const outputIndex = args.indexOf('--output')
+      if (outputIndex >= 0) {
+        await writeFile(args[outputIndex + 1]!, payload)
+      }
+      return {
+        code: 0,
+        stderr: '',
+        stdout: '',
+      }
+    },
+  }))
+
+  const stagingPath = join(
+    tmpdir(),
+    `openclaude-download-curl-binary-test-${Date.now()}-${Math.random()}`,
+  )
+  tempDirs.push(stagingPath)
+
+  const { downloadVersion } = await importFreshDownload()
+
+  await expect(downloadVersion('0.14.7', stagingPath)).resolves.toBe('binary')
+  await expect(readFile(join(stagingPath, 'openclaude.exe'))).resolves.toEqual(
+    payload,
+  )
+  expect(curlCalls).toHaveLength(1)
+  expect(curlCalls[0]?.join(' ')).toContain(
+    'https://github.com/AndersonBY/openclaude/releases/download/v0.14.7/openclaude-win32-x64.exe',
+  )
 })
 
 test('external binary reports missing GitHub Release platform clearly', async () => {

@@ -10,7 +10,7 @@
 import { feature } from 'bun:bundle'
 import axios from 'axios'
 import { createHash } from 'crypto'
-import { chmod, writeFile } from 'fs/promises'
+import { chmod, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { logEvent } from 'src/services/analytics/index.js'
 import type { ReleaseChannel } from '../config.js'
@@ -44,6 +44,90 @@ function getGitHubReleaseAssetName(platform: string): string {
   return platform.startsWith('win32')
     ? `openclaude-${platform}.exe`
     : `openclaude-${platform}`
+}
+
+function getCurlExecutable(): string {
+  return process.platform === 'win32' ? 'curl.exe' : 'curl'
+}
+
+function shouldFallbackToCurl(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  if (axios.isAxiosError(error)) {
+    return !error.response
+  }
+  return /EAI_AGAIN|ECONNRESET|ETIMEDOUT|ENOTFOUND|network|timeout/i.test(
+    message,
+  )
+}
+
+async function fetchJsonWithCurl(url: string, timeoutMs: number) {
+  const { stdout, stderr, code, error } = await execFileNoThrowWithCwd(
+    getCurlExecutable(),
+    [
+      '-L',
+      '--fail',
+      '--silent',
+      '--show-error',
+      '--max-time',
+      String(Math.ceil(timeoutMs / 1000)),
+      url,
+    ],
+    {
+      timeout: timeoutMs + 5000,
+      preserveOutputOnError: true,
+    },
+  )
+
+  if (code !== 0) {
+    throw new Error(
+      `curl failed with code ${code}: ${error || stderr || 'no error output'}`,
+    )
+  }
+
+  return JSON.parse(stdout)
+}
+
+async function downloadFileWithCurl(
+  url: string,
+  outputPath: string,
+  timeoutMs: number,
+) {
+  const { stderr, code, error } = await execFileNoThrowWithCwd(
+    getCurlExecutable(),
+    [
+      '-L',
+      '--fail',
+      '--silent',
+      '--show-error',
+      '--max-time',
+      String(Math.ceil(timeoutMs / 1000)),
+      '--output',
+      outputPath,
+      url,
+    ],
+    {
+      timeout: timeoutMs + 5000,
+      preserveOutputOnError: true,
+    },
+  )
+
+  if (code !== 0) {
+    throw new Error(
+      `curl failed with code ${code}: ${error || stderr || 'no error output'}`,
+    )
+  }
+}
+
+function verifyChecksum(data: Buffer, expectedChecksum: string) {
+  const hash = createHash('sha256')
+  hash.update(data)
+  const actualChecksum = hash.digest('hex')
+
+  if (actualChecksum !== expectedChecksum) {
+    throw new Error(
+      `Checksum mismatch: expected ${expectedChecksum}, got ${actualChecksum}`,
+    )
+  }
 }
 
 function isReleaseVersion(value: unknown): value is string {
@@ -418,16 +502,7 @@ async function downloadAndVerifyBinary(
 
       clearStallTimer()
 
-      // Verify checksum
-      const hash = createHash('sha256')
-      hash.update(response.data)
-      const actualChecksum = hash.digest('hex')
-
-      if (actualChecksum !== expectedChecksum) {
-        throw new Error(
-          `Checksum mismatch: expected ${expectedChecksum}, got ${actualChecksum}`,
-        )
-      }
+      verifyChecksum(Buffer.from(response.data), expectedChecksum)
 
       // Write binary to disk
       await writeFile(binaryPath, Buffer.from(response.data))
@@ -571,6 +646,30 @@ export async function downloadVersionFromBinaryRepo(
   }
 }
 
+async function downloadAndVerifyGitHubReleaseBinary(
+  binaryUrl: string,
+  expectedChecksum: string,
+  binaryPath: string,
+) {
+  try {
+    await downloadAndVerifyBinary(binaryUrl, expectedChecksum, binaryPath)
+  } catch (error) {
+    if (!shouldFallbackToCurl(error)) {
+      throw error
+    }
+
+    logForDebugging(
+      `GitHub Release binary download via axios failed (${
+        error instanceof Error ? error.message : String(error)
+      }); retrying with curl`,
+      { level: 'warn' },
+    )
+    await downloadFileWithCurl(binaryUrl, binaryPath, 5 * 60000)
+    verifyChecksum(await readFile(binaryPath), expectedChecksum)
+    await chmod(binaryPath, 0o755)
+  }
+}
+
 export async function downloadVersionFromGitHubRelease(
   version: string,
   stagingPath: string,
@@ -588,11 +687,24 @@ export async function downloadVersionFromGitHubRelease(
   let manifest
   const manifestUrl = `${GITHUB_RELEASE_DOWNLOAD_BASE_URL}/${tag}/manifest.json`
   try {
-    const manifestResponse = await axios.get(manifestUrl, {
-      timeout: 30000,
-      responseType: 'json',
-    })
-    manifest = manifestResponse.data
+    try {
+      const manifestResponse = await axios.get(manifestUrl, {
+        timeout: 30000,
+        responseType: 'json',
+      })
+      manifest = manifestResponse.data
+    } catch (error) {
+      if (!shouldFallbackToCurl(error)) {
+        throw error
+      }
+      logForDebugging(
+        `GitHub Release manifest fetch via axios failed (${
+          error instanceof Error ? error.message : String(error)
+        }); retrying with curl`,
+        { level: 'warn' },
+      )
+      manifest = await fetchJsonWithCurl(manifestUrl, 30000)
+    }
   } catch (error) {
     const latencyMs = Date.now() - startTime
     const errorMessage = error instanceof Error ? error.message : String(error)
@@ -630,7 +742,11 @@ export async function downloadVersionFromGitHubRelease(
   const binaryPath = join(stagingPath, binaryName)
 
   try {
-    await downloadAndVerifyBinary(binaryUrl, expectedChecksum, binaryPath)
+    await downloadAndVerifyGitHubReleaseBinary(
+      binaryUrl,
+      expectedChecksum,
+      binaryPath,
+    )
     const latencyMs = Date.now() - startTime
     logEvent('tengu_binary_download_success', {
       latency_ms: latencyMs,
