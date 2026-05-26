@@ -690,6 +690,7 @@ async function updateSymlink(
         // Try to copy new executable, with rollback on failure
         try {
           await copyFile(targetPath, symlinkPath)
+          await chmod(symlinkPath, 0o755)
           // Success - try immediate cleanup of old file (non-blocking)
           try {
             await unlink(oldFileName)
@@ -717,6 +718,7 @@ async function updateSymlink(
         // rather than a stat() pre-check (avoids TOCTOU + extra syscall)
         try {
           await copyFile(targetPath, symlinkPath)
+          await chmod(symlinkPath, 0o755)
         } catch (e) {
           if (isENOENT(e)) {
             throw new Error(`Source file does not exist: ${targetPath}`)
@@ -724,7 +726,6 @@ async function updateSymlink(
           throw e
         }
       }
-      // chmod is not needed on Windows - executability is determined by .exe extension
       return true
     } catch (error) {
       logError(
