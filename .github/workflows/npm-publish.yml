@@ -24,16 +24,16 @@ jobs:
         include:
           - platform: linux-x64
             runner: ubuntu-latest
-            output: claude-linux-x64
+            output: openclaude-linux-x64
           - platform: darwin-x64
             runner: macos-15-intel
-            output: claude-darwin-x64
+            output: openclaude-darwin-x64
           - platform: darwin-arm64
             runner: macos-14
-            output: claude-darwin-arm64
+            output: openclaude-darwin-arm64
           - platform: win32-x64
             runner: windows-latest
-            output: claude-win32-x64.exe
+            output: openclaude-win32-x64.exe
 
     steps:
       - name: Check out tag

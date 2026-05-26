@@ -66,6 +66,30 @@ test('install command displays openclaude.exe path on Windows', async () => {
   )
 })
 
+test('native installer uses openclaude binary name for forked package', async () => {
+  ;(globalThis as Record<string, unknown>).MACRO = {
+    PACKAGE_URL: '@makerbi/openclaude',
+  }
+
+  const { getBinaryName, getCliBinaryName } = await importFreshInstaller()
+
+  expect(getCliBinaryName()).toBe('openclaude')
+  expect(getBinaryName('linux-x64')).toBe('openclaude')
+  expect(getBinaryName('win32-x64')).toBe('openclaude.exe')
+})
+
+test('native installer preserves upstream claude binary name for upstream package', async () => {
+  ;(globalThis as Record<string, unknown>).MACRO = {
+    PACKAGE_URL: '@anthropic-ai/claude-code',
+  }
+
+  const { getBinaryName, getCliBinaryName } = await importFreshInstaller()
+
+  expect(getCliBinaryName()).toBe('claude')
+  expect(getBinaryName('linux-x64')).toBe('claude')
+  expect(getBinaryName('win32-x64')).toBe('claude.exe')
+})
+
 test('cleanupNpmInstallations removes both openclaude and legacy claude local install dirs', async () => {
   const removedPaths: string[] = []
   ;(globalThis as Record<string, unknown>).MACRO = {
@@ -98,4 +122,41 @@ test('cleanupNpmInstallations removes both openclaude and legacy claude local in
 
   expect(removedPaths).toContain(join(homedir(), '.openclaude', 'local'))
   expect(removedPaths).toContain(join(homedir(), '.claude', 'local'))
+})
+
+test('cleanupNpmInstallations does not uninstall the current openclaude npm shim', async () => {
+  const uninstallTargets: string[] = []
+  ;(globalThis as Record<string, unknown>).MACRO = {
+    PACKAGE_URL: '@makerbi/openclaude',
+  }
+
+  mock.module('fs/promises', () => ({
+    ...fsPromises,
+    rm: async () => {},
+  }))
+
+  mock.module('./execFileNoThrow.js', () => ({
+    ...realExecFileNoThrow,
+    execFileNoThrowWithCwd: async (_cmd: string, args: string[]) => {
+      if (args[0] === 'uninstall') {
+        uninstallTargets.push(args[2]!)
+      }
+      return {
+        code: 1,
+        stderr: 'npm ERR! code E404',
+      }
+    },
+  }))
+
+  mock.module('./envUtils.js', () => ({
+    ...realEnvUtils,
+    getClaudeConfigHomeDir: () => join(homedir(), '.openclaude'),
+    isEnvTruthy: (value: string | undefined) => value === '1',
+  }))
+
+  const { cleanupNpmInstallations } = await importFreshInstaller()
+  await cleanupNpmInstallations()
+
+  expect(uninstallTargets).toEqual(['@anthropic-ai/claude-code'])
+  expect(uninstallTargets).not.toContain('@makerbi/openclaude')
 })

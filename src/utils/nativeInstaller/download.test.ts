@@ -9,12 +9,17 @@ import {
 } from '../../test/sharedMutationLock.js'
 
 const originalEnv = { ...process.env }
+const originalMacro = (globalThis as Record<string, unknown>).MACRO
+const hadOriginalMacro = Object.hasOwn(globalThis, 'MACRO')
 
 let tempDirs: string[] = []
 
 beforeEach(async () => {
   await acquireSharedMutationLock('utils/nativeInstaller/download.test.ts')
   process.env = { ...originalEnv }
+  ;(globalThis as Record<string, unknown>).MACRO = {
+    PACKAGE_URL: '@makerbi/openclaude',
+  }
   delete process.env.USER_TYPE
   tempDirs = []
 })
@@ -22,6 +27,11 @@ beforeEach(async () => {
 afterEach(async () => {
   try {
     process.env = { ...originalEnv }
+    if (hadOriginalMacro) {
+      ;(globalThis as Record<string, unknown>).MACRO = originalMacro
+    } else {
+      delete (globalThis as Record<string, unknown>).MACRO
+    }
     mock.restore()
     await Promise.all(
       tempDirs.map(dir => rm(dir, { recursive: true, force: true })),
@@ -39,7 +49,7 @@ function mockInstaller(platform = 'linux-x64') {
   mock.module('./installer.js', () => ({
     getPlatform: () => platform,
     getBinaryName: (value: string) =>
-      value.startsWith('win32') ? 'claude.exe' : 'claude',
+      value.startsWith('win32') ? 'openclaude.exe' : 'openclaude',
   }))
 }
 
@@ -117,7 +127,7 @@ test('external binary downloads GitHub Release asset and stages canonical execut
           platforms: {
             'linux-x64': {
               checksum: sha256(payload),
-              asset: 'claude-linux-x64',
+              asset: 'openclaude-linux-x64',
             },
           },
         },
@@ -126,7 +136,7 @@ test('external binary downloads GitHub Release asset and stages canonical execut
 
     if (
       url ===
-      'https://github.com/AndersonBY/openclaude/releases/download/v0.14.3/claude-linux-x64'
+      'https://github.com/AndersonBY/openclaude/releases/download/v0.14.3/openclaude-linux-x64'
     ) {
       return { data: payload }
     }
@@ -142,10 +152,12 @@ test('external binary downloads GitHub Release asset and stages canonical execut
   const { downloadVersion } = await importFreshDownload()
 
   await expect(downloadVersion('0.14.3', stagingPath)).resolves.toBe('binary')
-  await expect(readFile(join(stagingPath, 'claude'))).resolves.toEqual(payload)
+  await expect(readFile(join(stagingPath, 'openclaude'))).resolves.toEqual(
+    payload,
+  )
   expect(calls).toEqual([
     'https://github.com/AndersonBY/openclaude/releases/download/v0.14.3/manifest.json',
-    'https://github.com/AndersonBY/openclaude/releases/download/v0.14.3/claude-linux-x64',
+    'https://github.com/AndersonBY/openclaude/releases/download/v0.14.3/openclaude-linux-x64',
   ])
 })
 
@@ -161,7 +173,7 @@ test('external binary reports missing GitHub Release platform clearly', async ()
           platforms: {
             'linux-x64': {
               checksum: sha256(Buffer.from('linux')),
-              asset: 'claude-linux-x64',
+              asset: 'openclaude-linux-x64',
             },
           },
         },

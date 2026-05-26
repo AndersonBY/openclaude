@@ -2,7 +2,7 @@ import { createHash } from 'crypto'
 import { readdir, readFile, writeFile } from 'fs/promises'
 import { basename, join } from 'path'
 
-const PLATFORM_ASSET_RE = /^claude-(linux-x64|darwin-x64|darwin-arm64|win32-x64\.exe)$/
+const PLATFORM_ASSET_RE = /^openclaude-(linux-x64|darwin-x64|darwin-arm64|win32-x64\.exe)$/
 
 function platformFromAssetName(assetName: string): string | null {
   const match = assetName.match(PLATFORM_ASSET_RE)

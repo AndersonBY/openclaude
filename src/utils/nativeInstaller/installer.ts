@@ -84,6 +84,12 @@ export type SetupMessage = {
   type: 'path' | 'alias' | 'info' | 'error'
 }
 
+export function getCliBinaryName(): string {
+  return MACRO.PACKAGE_URL === '@anthropic-ai/claude-code'
+    ? 'claude'
+    : 'openclaude'
+}
+
 export function getPlatform(): string {
   // Use env.platform which already handles platform detection and defaults to 'linux'
   const os = env.platform
@@ -109,22 +115,24 @@ export function getPlatform(): string {
 }
 
 export function getBinaryName(platform: string): string {
-  return platform.startsWith('win32') ? 'claude.exe' : 'claude'
+  const binaryName = getCliBinaryName()
+  return platform.startsWith('win32') ? `${binaryName}.exe` : binaryName
 }
 
 function getBaseDirectories() {
   const platform = getPlatform()
   const executableName = getBinaryName(platform)
+  const appDirName = getCliBinaryName()
 
   return {
     // Data directories (permanent storage)
-    versions: join(getXDGDataHome(), 'claude', 'versions'),
+    versions: join(getXDGDataHome(), appDirName, 'versions'),
 
     // Cache directories (can be deleted)
-    staging: join(getXDGCacheHome(), 'claude', 'staging'),
+    staging: join(getXDGCacheHome(), appDirName, 'staging'),
 
     // State directories
-    locks: join(getXDGStateHome(), 'claude', 'locks'),
+    locks: join(getXDGStateHome(), appDirName, 'locks'),
 
     // User bin
     executable: join(getUserBinDir(), executableName),
@@ -465,7 +473,7 @@ async function performVersionUpdate(
     logForDebugging(`Version ${version} already installed, updating symlink`)
   }
 
-  // Create direct symlink from ~/.local/bin/claude to the version binary
+  // Create direct symlink/copy from ~/.local/bin/<command> to the version binary
   await removeDirectoryIfEmpty(executablePath)
   await updateSymlink(executablePath, installPath)
 
@@ -845,7 +853,7 @@ export async function checkInstall(
     })
   }
 
-  // Check if claude executable exists and is valid.
+  // Check if the native executable exists and is valid.
   // On non-Windows, call readlink directly and route errno — ENOENT means
   // the executable is missing, EINVAL means it exists but isn't a symlink.
   // This avoids an access()→readlink() TOCTOU where deletion between the
@@ -856,7 +864,7 @@ export async function checkInstall(
     // On Windows it's a copied executable, not a symlink
     if (!(await isPossibleClaudeBinary(dirs.executable))) {
       messages.push({
-        message: `installMethod is native, but claude command is missing or invalid at ${dirs.executable}`,
+        message: `installMethod is native, but ${getCliBinaryName()} command is missing or invalid at ${dirs.executable}`,
         userActionRequired: true,
         type: 'error',
       })
@@ -875,7 +883,7 @@ export async function checkInstall(
     } catch (e) {
       if (isENOENT(e)) {
         messages.push({
-          message: `installMethod is native, but claude command not found at ${dirs.executable}`,
+          message: `installMethod is native, but ${getCliBinaryName()} command not found at ${dirs.executable}`,
           userActionRequired: true,
           type: 'error',
         })
@@ -883,7 +891,7 @@ export async function checkInstall(
         // EINVAL (not a symlink) or other — check as regular binary
         if (!(await isPossibleClaudeBinary(dirs.executable))) {
           messages.push({
-            message: `${dirs.executable} exists but is not a valid Claude binary`,
+            message: `${dirs.executable} exists but is not a valid ${getCliBinaryName()} binary`,
             userActionRequired: true,
             type: 'error',
           })
@@ -1191,11 +1199,14 @@ export async function cleanupOldVersions(): Promise<void> {
   // Clean up old renamed executables on Windows (no longer running at startup)
   if (getPlatform().startsWith('win32')) {
     const executableDir = dirname(dirs.executable)
+    const oldExecutablePattern = new RegExp(
+      `^${getBinaryName(getPlatform()).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.old\\.\\d+$`,
+    )
     try {
       const files = await readdir(executableDir)
       let cleanedCount = 0
       for (const file of files) {
-        if (!/^claude\.exe\.old\.\d+$/.test(file)) continue
+        if (!oldExecutablePattern.test(file)) continue
         try {
           await unlink(join(executableDir, file))
           cleanedCount++
@@ -1458,7 +1469,7 @@ async function isNpmSymlink(executablePath: string): Promise<boolean> {
 }
 
 /**
- * Remove the claude symlink from the executable directory
+ * Remove the native command symlink/copy from the executable directory
  * This is used when switching away from native installation
  * Will only remove if it's a native binary symlink, not npm-managed JS files
  */
@@ -1476,12 +1487,12 @@ export async function removeInstalledSymlink(): Promise<void> {
 
     // It's a native binary symlink, safe to remove
     await unlink(dirs.executable)
-    logForDebugging(`Removed claude symlink at ${dirs.executable}`)
+    logForDebugging(`Removed native executable at ${dirs.executable}`)
   } catch (error) {
     if (isENOENT(error)) {
       return
     }
-    logError(new Error(`Failed to remove claude symlink: ${error}`))
+    logError(new Error(`Failed to remove native executable: ${error}`))
   }
 }
 
@@ -1540,6 +1551,8 @@ async function manualRemoveNpmPackage(
     }
 
     const globalPrefix = prefixResult.stdout.trim()
+    const packageBinName =
+      packageName === '@anthropic-ai/claude-code' ? 'claude' : getCliBinaryName()
     let manuallyRemoved = false
 
     // Helper to try removing a file. unlink alone is sufficient — it throws
@@ -1558,9 +1571,9 @@ async function manualRemoveNpmPackage(
 
     if (getPlatform().startsWith('win32')) {
       // Windows - only remove executables, not the package directory
-      const binCmd = join(globalPrefix, 'claude.cmd')
-      const binPs1 = join(globalPrefix, 'claude.ps1')
-      const binExe = join(globalPrefix, 'claude')
+      const binCmd = join(globalPrefix, `${packageBinName}.cmd`)
+      const binPs1 = join(globalPrefix, `${packageBinName}.ps1`)
+      const binExe = join(globalPrefix, packageBinName)
 
       if (await tryRemove(binCmd, 'bin script')) {
         manuallyRemoved = true
@@ -1575,7 +1588,7 @@ async function manualRemoveNpmPackage(
       }
     } else {
       // Unix/Mac - only remove symlink, not the package directory
-      const binSymlink = join(globalPrefix, 'bin', 'claude')
+      const binSymlink = join(globalPrefix, 'bin', packageBinName)
 
       if (await tryRemove(binSymlink, 'bin symlink')) {
         manuallyRemoved = true
@@ -1675,18 +1688,9 @@ export async function cleanupNpmInstallations(): Promise<{
     errors.push(codePackageResult.error)
   }
 
-  // Also attempt to remove MACRO.PACKAGE_URL if it's defined and different
-  if (MACRO.PACKAGE_URL && MACRO.PACKAGE_URL !== '@anthropic-ai/claude-code') {
-    const macroPackageResult = await attemptNpmUninstall(MACRO.PACKAGE_URL)
-    if (macroPackageResult.success) {
-      removed++
-      if (macroPackageResult.warning) {
-        warnings.push(macroPackageResult.warning)
-      }
-    } else if (macroPackageResult.error) {
-      errors.push(macroPackageResult.error)
-    }
-  }
+  // Keep the current npm package installed. It provides the command used to run
+  // this installer in the current shell; the native executable takes precedence
+  // once ~/.local/bin is on PATH.
 
   // Preserve compatibility with pre-migration installs under ~/.claude/local.
   const localInstallDirs = Array.from(

@@ -42,8 +42,8 @@ function normalizeReleaseVersion(tagName: string): string {
 
 function getGitHubReleaseAssetName(platform: string): string {
   return platform.startsWith('win32')
-    ? `claude-${platform}.exe`
-    : `claude-${platform}`
+    ? `openclaude-${platform}.exe`
+    : `openclaude-${platform}`
 }
 
 function isReleaseVersion(value: unknown): value is string {

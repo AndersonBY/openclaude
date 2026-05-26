@@ -27,10 +27,10 @@ function sha256(value: string) {
 describe('native release manifest', () => {
   test('maps common platform binary assets to checksummed installer manifest entries', async () => {
     const dir = await makeTempDir()
-    await writeFile(join(dir, 'claude-linux-x64'), 'linux')
-    await writeFile(join(dir, 'claude-darwin-x64'), 'mac-intel')
-    await writeFile(join(dir, 'claude-darwin-arm64'), 'mac-arm')
-    await writeFile(join(dir, 'claude-win32-x64.exe'), 'windows')
+    await writeFile(join(dir, 'openclaude-linux-x64'), 'linux')
+    await writeFile(join(dir, 'openclaude-darwin-x64'), 'mac-intel')
+    await writeFile(join(dir, 'openclaude-darwin-arm64'), 'mac-arm')
+    await writeFile(join(dir, 'openclaude-win32-x64.exe'), 'windows')
 
     const manifest = await buildNativeReleaseManifest(dir)
 
@@ -38,19 +38,19 @@ describe('native release manifest', () => {
       platforms: {
         'darwin-arm64': {
           checksum: sha256('mac-arm'),
-          asset: 'claude-darwin-arm64',
+          asset: 'openclaude-darwin-arm64',
         },
         'darwin-x64': {
           checksum: sha256('mac-intel'),
-          asset: 'claude-darwin-x64',
+          asset: 'openclaude-darwin-x64',
         },
         'linux-x64': {
           checksum: sha256('linux'),
-          asset: 'claude-linux-x64',
+          asset: 'openclaude-linux-x64',
         },
         'win32-x64': {
           checksum: sha256('windows'),
-          asset: 'claude-win32-x64.exe',
+          asset: 'openclaude-win32-x64.exe',
         },
       },
     })
@@ -61,7 +61,7 @@ describe('native release manifest', () => {
 
   test('fails before publishing when a common platform asset is missing', async () => {
     const dir = await makeTempDir()
-    await writeFile(join(dir, 'claude-linux-x64'), 'linux')
+    await writeFile(join(dir, 'openclaude-linux-x64'), 'linux')
 
     await expect(buildNativeReleaseManifest(dir)).rejects.toThrow(
       'Missing native binaries for platforms: darwin-arm64, darwin-x64, win32-x64',
