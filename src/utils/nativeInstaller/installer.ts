@@ -149,9 +149,12 @@ async function isPossibleClaudeBinary(filePath: string): Promise<boolean> {
       return false
     }
 
-    // Check if file is executable. Note: On Windows, this relies on file extensions
-    // (.exe, .bat, .cmd) and ACL permissions rather than Unix permission bits,
-    // so it may not work perfectly for all executable files on Windows.
+    // Windows executability is extension/ACL-based, not Unix mode-bit based.
+    // This also keeps Windows-branch tests deterministic on Linux CI runners.
+    if (env.platform === 'win32') {
+      return true
+    }
+
     await access(filePath, fsConstants.X_OK)
     return true
   } catch {
