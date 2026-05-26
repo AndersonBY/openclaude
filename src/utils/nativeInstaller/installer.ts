@@ -15,6 +15,7 @@ import {
   access,
   chmod,
   copyFile,
+  readFile,
   lstat,
   mkdir,
   readdir,
@@ -669,9 +670,14 @@ async function updateSymlink(
       if (existingStats) {
         try {
           const targetStats = await stat(targetPath)
-          // If sizes match, assume files are the same (avoid reading large files)
           if (existingStats.size === targetStats.size) {
-            return false
+            const [existingContent, targetContent] = await Promise.all([
+              readFile(symlinkPath),
+              readFile(targetPath),
+            ])
+            if (existingContent.equals(targetContent)) {
+              return false
+            }
           }
         } catch {
           // Continue with copy if we can't compare
