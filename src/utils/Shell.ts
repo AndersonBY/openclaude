@@ -39,7 +39,7 @@ import { getCachedPowerShellPath } from './shell/powershellDetection.js'
 import { createPowerShellProvider } from './shell/powershellProvider.js'
 import type { ShellProvider, ShellType } from './shell/shellProvider.js'
 import { subprocessEnv } from './subprocessEnv.js'
-import { posixPathToWindowsPath } from './windowsPaths.js'
+import { findGitBashPath, posixPathToWindowsPath } from './windowsPaths.js'
 
 const DEFAULT_TIMEOUT = 30 * 60 * 1000 // 30 minutes
 
@@ -86,6 +86,10 @@ export async function findSuitableShell(): Promise<string> {
         `CLAUDE_CODE_SHELL="${shellOverride}" is not a valid bash/zsh path, falling back to detection`,
       )
     }
+  }
+
+  if (getPlatform() === 'windows') {
+    return findGitBashPath()
   }
 
   // Check user's preferred shell from environment
@@ -138,7 +142,9 @@ export async function findSuitableShell(): Promise<string> {
 
 async function getShellConfigImpl(): Promise<ShellConfig> {
   const binShell = await findSuitableShell()
-  const provider = await createBashShellProvider(binShell)
+  const provider = await createBashShellProvider(binShell, {
+    skipSnapshot: process.env.NODE_ENV === 'test',
+  })
   return { provider }
 }
 

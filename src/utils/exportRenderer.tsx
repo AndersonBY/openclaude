@@ -82,7 +82,7 @@ export async function streamRenderedMessages(messages: Message[], tools: Tools, 
 } = {}): Promise<void> {
   const renderChunk = (range: readonly [number, number]) => renderToAnsiString(<AppStateProvider>
         <StaticKeybindingProvider>
-          <Messages messages={messages} tools={tools} commands={[]} verbose={verbose} toolJSX={null} toolUseConfirmQueue={[]} inProgressToolUseIDs={new Set()} isMessageSelectorVisible={false} conversationId="export" screen="prompt" streamingToolUses={[]} showAllInTranscript={true} isLoading={false} renderRange={range} />
+          <Messages messages={messages} tools={tools} commands={[]} verbose={verbose} toolJSX={null} toolUseConfirmQueue={[]} inProgressToolUseIDs={new Set()} isMessageSelectorVisible={false} conversationId="export" screen="prompt" streamingToolUses={[]} showAllInTranscript={true} hideLogo={true} isLoading={false} renderRange={range} />
         </StaticKeybindingProvider>
       </AppStateProvider>, columns);
 

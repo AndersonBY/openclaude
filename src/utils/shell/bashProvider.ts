@@ -60,6 +60,7 @@ export async function createBashShellProvider(
   options?: { skipSnapshot?: boolean },
 ): Promise<ShellProvider> {
   let currentSandboxTmpDir: string | undefined
+  const skipSnapshot = options?.skipSnapshot === true
   const snapshotPromise: Promise<string | undefined> = options?.skipSnapshot
     ? Promise.resolve(undefined)
     : createAndSaveSnapshot(shellPath).catch(error => {
@@ -198,7 +199,7 @@ export async function createBashShellProvider(
     },
 
     getSpawnArgs(commandString: string): string[] {
-      const skipLoginShell = lastSnapshotFilePath !== undefined
+      const skipLoginShell = skipSnapshot || lastSnapshotFilePath !== undefined
       if (skipLoginShell) {
         logForDebugging('Spawning shell without login (-l flag skipped)')
       }

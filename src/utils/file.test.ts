@@ -3,12 +3,20 @@ import {
   acquireSharedMutationLock,
   releaseSharedMutationLock,
 } from '../test/sharedMutationLock.js'
+import * as actualGrowthbook from '../services/analytics/growthbook.js'
 
 async function importFileModuleWithKillswitchEnabled(
   killswitchEnabled: boolean,
 ) {
   mock.module('../services/analytics/growthbook.js', () => ({
-    getFeatureValue_CACHED_MAY_BE_STALE: () => killswitchEnabled,
+    ...actualGrowthbook,
+    getFeatureValue_CACHED_MAY_BE_STALE: <T>(
+      key: string,
+      defaultValue: T,
+    ) =>
+      key === 'tengu_compact_line_prefix_killswitch'
+        ? (killswitchEnabled as T)
+        : defaultValue,
   }))
 
   return import(`./file.js?ts=${Date.now()}-${Math.random()}`)
@@ -21,6 +29,7 @@ beforeAll(async () => {
 afterAll(() => {
   try {
     mock.restore()
+    mock.module('../services/analytics/growthbook.js', () => actualGrowthbook)
   } finally {
     releaseSharedMutationLock()
   }
