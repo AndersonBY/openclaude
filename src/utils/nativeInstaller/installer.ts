@@ -481,6 +481,14 @@ async function performVersionUpdate(
   await removeDirectoryIfEmpty(executablePath)
   await updateSymlink(executablePath, installPath)
 
+  if (!(await executableMatchesInstallPath(executablePath, installPath))) {
+    throw new Error(
+      `Failed to update executable at ${executablePath} to installed version ${version}. ` +
+        `The executable does not match ${installPath}. ` +
+        `Check write permissions to ${executablePath}.`,
+    )
+  }
+
   // Verify the executable was actually created/updated
   if (!(await isPossibleClaudeBinary(executablePath))) {
     let installPathExists = false
@@ -736,7 +744,7 @@ async function updateSymlink(
           `Failed to copy executable from ${targetPath} to ${symlinkPath}: ${error}`,
         ),
       )
-      return false
+      throw error
     }
   }
 
@@ -750,7 +758,7 @@ async function updateSymlink(
     logError(
       new Error(`Failed to create directory ${parentDir}: ${mkdirError}`),
     )
-    return false
+    throw mkdirError
   }
 
   // Check if symlink already exists and points to the correct target
@@ -811,7 +819,53 @@ async function updateSymlink(
         `Failed to create symlink from ${symlinkPath} to ${targetPath}: ${error}`,
       ),
     )
+    throw error
+  }
+}
+
+async function filesHaveSameContent(
+  leftPath: string,
+  rightPath: string,
+): Promise<boolean> {
+  try {
+    const [leftStats, rightStats] = await Promise.all([
+      stat(leftPath),
+      stat(rightPath),
+    ])
+    if (
+      !leftStats.isFile() ||
+      !rightStats.isFile() ||
+      leftStats.size !== rightStats.size
+    ) {
+      return false
+    }
+
+    const [leftContent, rightContent] = await Promise.all([
+      readFile(leftPath),
+      readFile(rightPath),
+    ])
+    return leftContent.equals(rightContent)
+  } catch {
     return false
+  }
+}
+
+async function executableMatchesInstallPath(
+  executablePath: string,
+  installPath: string,
+): Promise<boolean> {
+  if (getPlatform().startsWith('win32')) {
+    return filesHaveSameContent(executablePath, installPath)
+  }
+
+  try {
+    const target = await readlink(executablePath)
+    return (
+      resolve(dirname(executablePath), target) === resolve(installPath) &&
+      (await isPossibleClaudeBinary(installPath))
+    )
+  } catch {
+    return filesHaveSameContent(executablePath, installPath)
   }
 }
 
