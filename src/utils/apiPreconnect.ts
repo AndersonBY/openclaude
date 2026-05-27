@@ -34,6 +34,15 @@ export function preconnectAnthropicApi(): void {
   if (fired) return
   fired = true
 
+  if (
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI) ||
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI) ||
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB) ||
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_MISTRAL)
+  ) {
+    return
+  }
+
   // Third-party providers should not warm a connection to Anthropic.
   if (getAPIProvider() !== 'firstParty') {
     return

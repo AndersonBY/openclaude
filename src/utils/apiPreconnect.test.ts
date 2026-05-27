@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import {
   acquireSharedMutationLock,
   releaseSharedMutationLock,
@@ -28,6 +29,53 @@ afterEach(() => {
 })
 
 describe('preconnectAnthropicApi', () => {
+  test('does not reuse a stale first-party provider module mock', async () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--eval',
+        `
+          import { mock } from 'bun:test'
+
+          process.env.CLAUDE_CODE_USE_OPENAI = '1'
+          mock.module('./src/utils/model/providers.js', () => ({
+            getAPIProvider: () => 'firstParty',
+            getAPIProviderForStatsig: () => 'firstParty',
+            usesAnthropicAccountFlow: () => true,
+            isGithubNativeAnthropicMode: () => false,
+            isFirstPartyAnthropicBaseUrl: () => true,
+          }))
+          await import('./src/utils/model/providers.js')
+          mock.restore()
+
+          let calls = 0
+          globalThis.fetch = () => {
+            calls += 1
+            return Promise.resolve(new Response(null, { status: 200 }))
+          }
+          const { preconnectAnthropicApi } = await import(
+            \`./src/utils/apiPreconnect.ts?child=\${Date.now()}\`
+          )
+          preconnectAnthropicApi()
+
+          if (calls !== 0) {
+            throw new Error(\`expected no fetch, received \${calls}\`)
+          }
+        `,
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+      },
+    )
+
+    if (result.status !== 0) {
+      throw new Error(
+        `child process failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      )
+    }
+  })
+
   test('does not fetch when OpenAI mode is enabled', async () => {
     process.env.CLAUDE_CODE_USE_OPENAI = '1'
     const fetchMock = mock(() => Promise.resolve(new Response(null, { status: 200 })))
