@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { spawnSync } from 'node:child_process'
 import {
   acquireSharedMutationLock,
   releaseSharedMutationLock,
@@ -29,82 +28,36 @@ afterEach(() => {
 })
 
 describe('preconnectAnthropicApi', () => {
-  test('does not reuse a stale first-party provider module mock', async () => {
-    const result = spawnSync(
-      process.execPath,
-      [
-        '--eval',
-        `
-          import { mock } from 'bun:test'
-
-          process.env.CLAUDE_CODE_USE_OPENAI = '1'
-          mock.module('./src/utils/model/providers.js', () => ({
-            getAPIProvider: () => 'firstParty',
-            getAPIProviderForStatsig: () => 'firstParty',
-            usesAnthropicAccountFlow: () => true,
-            isGithubNativeAnthropicMode: () => false,
-            isFirstPartyAnthropicBaseUrl: () => true,
-          }))
-          await import('./src/utils/model/providers.js')
-          mock.restore()
-
-          let calls = 0
-          globalThis.fetch = () => {
-            calls += 1
-            return Promise.resolve(new Response(null, { status: 200 }))
-          }
-          const { preconnectAnthropicApi } = await import(
-            \`./src/utils/apiPreconnect.ts?child=\${Date.now()}\`
-          )
-          preconnectAnthropicApi()
-
-          if (calls !== 0) {
-            throw new Error(\`expected no fetch, received \${calls}\`)
-          }
-        `,
-      ],
-      {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-      },
-    )
-
-    if (result.status !== 0) {
-      throw new Error(
-        `child process failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-      )
-    }
-  })
-
+  // The provider is injected directly rather than mocking getAPIProvider():
+  // bun does not unregister mock.module() overrides, so a leaked providers.js
+  // mock from another test file (e.g. fastMode) would otherwise force
+  // getAPIProvider() to 'firstParty' here and break these assertions.
   test('does not fetch when OpenAI mode is enabled', async () => {
-    process.env.CLAUDE_CODE_USE_OPENAI = '1'
     const fetchMock = mock(() => Promise.resolve(new Response(null, { status: 200 })))
     globalThis.fetch = fetchMock as typeof globalThis.fetch
 
     const { preconnectAnthropicApi } = await importFreshModule()
-    preconnectAnthropicApi()
+    preconnectAnthropicApi('openai')
 
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
   test('does not fetch when Gemini mode is enabled', async () => {
-    process.env.CLAUDE_CODE_USE_GEMINI = '1'
     const fetchMock = mock(() => Promise.resolve(new Response(null, { status: 200 })))
     globalThis.fetch = fetchMock as typeof globalThis.fetch
 
     const { preconnectAnthropicApi } = await importFreshModule()
-    preconnectAnthropicApi()
+    preconnectAnthropicApi('gemini')
 
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
   test('does not fetch when GitHub mode is enabled', async () => {
-    process.env.CLAUDE_CODE_USE_GITHUB = '1'
     const fetchMock = mock(() => Promise.resolve(new Response(null, { status: 200 })))
     globalThis.fetch = fetchMock as typeof globalThis.fetch
 
     const { preconnectAnthropicApi } = await importFreshModule()
-    preconnectAnthropicApi()
+    preconnectAnthropicApi('github')
 
     expect(fetchMock).not.toHaveBeenCalled()
   })
@@ -113,9 +66,21 @@ describe('preconnectAnthropicApi', () => {
     delete process.env.CLAUDE_CODE_USE_OPENAI
     delete process.env.CLAUDE_CODE_USE_GEMINI
     delete process.env.CLAUDE_CODE_USE_GITHUB
+    delete process.env.CLAUDE_CODE_USE_MISTRAL
     delete process.env.CLAUDE_CODE_USE_BEDROCK
     delete process.env.CLAUDE_CODE_USE_VERTEX
     delete process.env.CLAUDE_CODE_USE_FOUNDRY
+    delete process.env.OPENAI_BASE_URL
+    delete process.env.OPENAI_API_BASE
+    delete process.env.OPENAI_MODEL
+    delete process.env.OPENAI_API_KEY
+    delete process.env.XAI_API_KEY
+    delete process.env.MINIMAX_API_KEY
+    delete process.env.VENICE_API_KEY
+    delete process.env.MIMO_API_KEY
+    delete process.env.NVIDIA_NIM
+    delete process.env.ANTHROPIC_BASE_URL
+    delete process.env.ANTHROPIC_API_KEY
     delete process.env.HTTPS_PROXY
     delete process.env.https_proxy
     delete process.env.HTTP_PROXY
@@ -128,7 +93,7 @@ describe('preconnectAnthropicApi', () => {
     globalThis.fetch = fetchMock as typeof globalThis.fetch
 
     const { preconnectAnthropicApi } = await importFreshModule()
-    preconnectAnthropicApi()
+    preconnectAnthropicApi('firstParty')
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })

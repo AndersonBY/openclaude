@@ -18,7 +18,7 @@ npm --version
 ## 2. Install OpenClaude
 
 ```powershell
-npm install -g @makerbi/openclaude
+npm install -g @makerbi/openclaude@latest
 ```
 
 ## 3. Pick One Provider

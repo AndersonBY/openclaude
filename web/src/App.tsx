@@ -117,7 +117,7 @@ function App() {
           <span className="sep">|</span>
           <a href="https://gitlawb.com">gitlawb ↗</a>
           <span className="sep">|</span>
-          <a href="https://github.com/Gitlawb/openclaude/blob/main/LICENSE">license</a>
+          <a href="https://github.com/AndersonBY/openclaude/blob/main/LICENSE">license</a>
           <span className="sep">·</span>
           <span>{new Date().getFullYear()}</span>
         </div>
@@ -146,7 +146,7 @@ function Hero() {
 
       <div className="hero-cta">
         <CopyableCommand command={installCommand} variant="hero" />
-        <a className="button button-ghost" href="https://github.com/Gitlawb/openclaude">
+        <a className="button button-ghost" href="https://github.com/AndersonBY/openclaude">
           view on github →
         </a>
       </div>

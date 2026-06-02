@@ -18,9 +18,8 @@ npm --version
 ## 2. Install OpenClaude
 
 ```bash
-npm install -g @makerbi/openclaude
+npm install -g @makerbi/openclaude@latest
 ```
-
 ## 3. Pick One Provider
 
 ### Option A: OpenAI

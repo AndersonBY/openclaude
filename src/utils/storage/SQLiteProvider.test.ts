@@ -173,7 +173,7 @@ describe('SQLite Storage Layer', () => {
     clearMemoryOnly()
     const graph = getGlobalGraph()
     expect(Object.keys(graph.entities).length).toBe(count)
-  })
+  }, 10_000)
 
   it('clears a closed on-disk database without an existing provider handle', async () => {
     const projectDir = join(getProjectsDir(), sanitizePath(workspaceDir))

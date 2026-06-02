@@ -1,4 +1,4 @@
-export const installCommand = 'npm install -g @gitlawb/openclaude'
+export const installCommand = 'npm install -g @makerbi/openclaude@latest'
 
 export const features = [
   {
@@ -30,6 +30,6 @@ export const features = [
 export const navLinks = [
   { href: '#features', label: 'features' },
   { href: '#install', label: 'install' },
-  { href: 'https://github.com/Gitlawb/openclaude', label: 'github' },
+  { href: 'https://github.com/AndersonBY/openclaude', label: 'github' },
   { href: 'https://gitlawb.com/node/repos/z6MkqDnb/openclaude', label: 'gitlawb' },
 ] as const
