@@ -395,6 +395,16 @@ export const SettingsSchema = lazySchema(() =>
             'If undefined, all models are available. If empty array, only the default model is available. ' +
             'Typically set in managed settings by enterprise administrators.',
         ),
+      providerProfileModelPickerMode: z
+        .enum(['auto', 'profile', 'provider'])
+        .optional()
+        .catch(undefined)
+        .describe(
+          'Controls /model options when an active provider profile is applied. ' +
+            '"profile" shows only explicitly configured profile models; ' +
+            '"provider" shows the provider catalog/discovery list plus explicit profile-only custom models; ' +
+            '"auto" uses profile mode when the profile has multiple explicitly configured models, otherwise provider mode.',
+        ),
       modelOverrides: z
         .record(z.string(), z.string())
         .optional()
@@ -740,14 +750,19 @@ export const SettingsSchema = lazySchema(() =>
         .record(
           z.string(),
           z.object({
+            model: z
+              .string()
+              .optional()
+              .describe('Actual model name to send to the API. Defaults to the surrounding agentModels key.'),
             base_url: z.string().url().describe('OpenAI-compatible API endpoint (must be https:// or http://)'),
             api_key: z.string().describe('API key for this provider'),
           }),
         )
         .optional()
         .describe(
-          'Map of model name to provider connection info. ' +
-            'Example: { "deepseek-chat": { "base_url": "https://api.deepseek.com/v1", "api_key": "sk-xxx" } }',
+          'Map of route key to provider connection info. ' +
+            'Example: { "deepseek-chat": { "base_url": "https://api.deepseek.com/v1", "api_key": "sk-xxx" } }. ' +
+            'Use "model" when the route key is an alias for a different API model name.',
         ),
       agentRouting: z
         .record(z.string(), z.string())

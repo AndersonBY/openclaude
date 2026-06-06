@@ -97,6 +97,12 @@ function mapOpenAICompatibilityFailureToAssistantMessage(options: {
         error: 'invalid_request',
       })
 
+    case 'vision_not_supported':
+      return createAssistantAPIErrorMessage({
+        content: `The provider at ${options.host} returned 404 for a request containing images. The model (${options.model}) may not support image/vision inputs. Try removing images from your message, or ${switchCmd} to a vision-capable model.`,
+        error: 'invalid_request',
+      })
+
     case 'model_not_found':
       return createAssistantAPIErrorMessage({
         content: `The selected model (${options.model}) is not available on this provider. Run ${switchCmd} to choose another model, or verify installed local models (for Ollama: ollama list).`,
@@ -1010,8 +1016,8 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       error: 'authentication_failed',
       content: getIsNonInteractiveSession()
-        ? `Failed to authenticate. ${API_ERROR_MESSAGE_PREFIX}: ${error.message}`
-        : `Please run /login · ${API_ERROR_MESSAGE_PREFIX}: ${error.message}`,
+        ? `Failed to authenticate. ${API_ERROR_MESSAGE_PREFIX}: Authentication failed (status ${error.status}). Check your API key configuration.`
+        : `Please run /login · ${API_ERROR_MESSAGE_PREFIX}: Authentication failed (status ${error.status}). Check your API key configuration.`,
     })
   }
 
