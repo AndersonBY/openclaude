@@ -31,6 +31,8 @@ describe('native release manifest', () => {
     await writeFile(join(dir, 'openclaude-darwin-x64'), 'mac-intel')
     await writeFile(join(dir, 'openclaude-darwin-arm64'), 'mac-arm')
     await writeFile(join(dir, 'openclaude-win32-x64.exe'), 'windows')
+    await writeFile(join(dir, 'openclaude-ubuntu24-x64'), 'ubuntu')
+    await writeFile(join(dir, 'openclaude-kylinv10-x64'), 'kylin')
 
     const manifest = await buildNativeReleaseManifest(dir)
 

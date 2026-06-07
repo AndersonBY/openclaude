@@ -4,6 +4,20 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to rebuild and overwrite assets for
+        required: true
+        default: v0.17.1
+      publish_npm:
+        description: Publish package to npm after refreshing assets
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 concurrency:
   group: npm-publish-${{ github.ref }}
@@ -90,10 +104,106 @@ jobs:
           path: native-dist/${{ matrix.output }}
           if-no-files-found: error
 
+  build-native-ubuntu24:
+    name: Build native Ubuntu 24 x64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build package
+        run: bun run build
+
+      - name: Build native Ubuntu 24 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native-dist
+          bun build \
+            --compile \
+            --target=bun \
+            --compile-autoload-package-json \
+            --external=sharp \
+            --external=@vscode/ripgrep \
+            --outfile="native-dist/openclaude-ubuntu24-x64" \
+            dist/cli.mjs
+          native-dist/openclaude-ubuntu24-x64 --version
+
+      - name: Upload native Ubuntu 24 binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-ubuntu24-x64
+          path: native-dist/openclaude-ubuntu24-x64
+          if-no-files-found: error
+
+  build-native-kylinv10:
+    name: Build native Kylin V10 x64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Build native Kylin V10 binary in container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            hxsoong/kylin:v10-sp1 \
+            bash -lc '
+              set -euo pipefail
+              yum install -y ca-certificates curl git gzip tar unzip xz
+              curl -fsSL https://bun.sh/install | bash
+              export BUN_INSTALL="$HOME/.bun"
+              export PATH="$BUN_INSTALL/bin:$PATH"
+              bun install --frozen-lockfile
+              bun run build
+              mkdir -p native-dist
+              bun build \
+                --compile \
+                --target=bun \
+                --compile-autoload-package-json \
+                --external=sharp \
+                --external=@vscode/ripgrep \
+                --outfile="native-dist/openclaude-kylinv10-x64" \
+                dist/cli.mjs
+            '
+          native-dist/openclaude-kylinv10-x64 --version
+
+      - name: Upload native Kylin V10 binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-kylinv10-x64
+          path: native-dist/openclaude-kylinv10-x64
+          if-no-files-found: error
+
   release-native:
     name: Publish GitHub Release binaries
     runs-on: ubuntu-latest
-    needs: build-native
+    needs:
+      - build-native
+      - build-native-ubuntu24
+      - build-native-kylinv10
 
     steps:
       - name: Check out tag
@@ -116,24 +226,43 @@ jobs:
       - name: Generate native manifest
         run: bun run build:native:manifest
 
-      - name: Create or update GitHub Release
+      - name: Generate pure offline packages
         env:
-          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        run: bun run scripts/offline-package.ts native-dist "$RELEASE_TAG"
+
+      - name: Verify pure offline package assets
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" native-dist/* --clobber
+          for asset in \
+            native-dist/openclaude-*-windows-x64-offline.zip \
+            native-dist/openclaude-*-ubuntu24-x64-offline.tar.gz \
+            native-dist/openclaude-*-kylinv10-x64-offline.tar.gz
+          do
+            test -f "$asset"
+          done
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" native-dist/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" native-dist/* \
-              --title "$GITHUB_REF_NAME" \
-              --notes "OpenClaude $GITHUB_REF_NAME"
+            gh release create "$RELEASE_TAG" native-dist/* \
+              --title "$RELEASE_TAG" \
+              --notes "OpenClaude $RELEASE_TAG"
           fi
 
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
     needs: release-native
+    if: github.event_name == 'push' || inputs.publish_npm == 'true'
     environment: npm-publish
 
     steps:

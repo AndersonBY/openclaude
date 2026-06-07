@@ -25,6 +25,7 @@
   "scripts": {
     "build": "bun run scripts/build.ts",
     "build:native:manifest": "bun run scripts/native-release-manifest.ts native-dist",
+    "build:offline-packages": "bun run scripts/offline-package.ts native-dist",
     "integrations:generate": "bun run scripts/generate-integrations-artifacts.ts",
     "integrations:check": "bun run scripts/generate-integrations-artifacts.ts --check",
     "dev": "bun run build && node bin/openclaude",

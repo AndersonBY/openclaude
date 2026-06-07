@@ -69,6 +69,8 @@ upstream bug fixes around them.
   `https://github.com/AndersonBY/openclaude/releases/download`
 - release assets are named:
   - `openclaude-linux-x64`
+  - `openclaude-ubuntu24-x64`
+  - `openclaude-kylinv10-x64`
   - `openclaude-darwin-x64`
   - `openclaude-darwin-arm64`
   - `openclaude-win32-x64.exe`
@@ -79,6 +81,10 @@ The native installer writes the executable as `openclaude` or
 under the `openclaude` app directory. It should not install or update a `claude`
 binary for this package.
 
+`manifest.json` is intentionally limited to the common native installer
+platforms. Ubuntu 24 and Kylin V10 binaries are release assets for pure-offline
+packages, not separate `openclaude install` targets.
+
 ### Release Workflow
 
 The official upstream release workflow is intentionally removed. This fork uses:
@@ -86,9 +92,10 @@ The official upstream release workflow is intentionally removed. This fork uses:
 - `.github/workflows/pr-checks.yml` for pushes and PRs on `main`
 - `.github/workflows/npm-publish.yml` for `v*` tag releases
 
-`npm-publish.yml` builds common native platforms first, uploads binaries and
-`manifest.json` to the GitHub Release, then publishes `@makerbi/openclaude` to
-npm. The npm environment is named `npm-publish`.
+`npm-publish.yml` builds common native platforms first, builds Ubuntu 24 x64 and
+Kylin V10 x64 binaries for pure-offline packages, uploads binaries,
+`manifest.json`, and the offline archives to the GitHub Release, then publishes
+`@makerbi/openclaude` to npm. The npm environment is named `npm-publish`.
 
 ## Upstream Merge Procedure
 
@@ -201,6 +208,17 @@ Only release from a clean, validated `main`.
    `manifest.json`; npm success alone is not enough because `openclaude install`
    depends on the release assets.
 
+   The release must also include the pure-offline package assets:
+
+   - `openclaude-<version>-windows-x64-offline.zip`
+   - `openclaude-<version>-ubuntu24-x64-offline.tar.gz`
+   - `openclaude-<version>-kylinv10-x64-offline.tar.gz`
+
+   These packages are for air-gapped target machines. Each archive contains the
+   native executable, `SHA256SUMS`, install/uninstall scripts, and a local
+   README. The target-machine install scripts must not fetch npm packages,
+   GitHub Release assets, or public container images.
+
 ## Install Verification
 
 After a release, verify both npm wrapper and native installer behavior.
@@ -253,6 +271,16 @@ gh release view v<version> --json assets
 gh run list --workflow npm-publish.yml --limit 10
 gh run view <run-id> --log-failed
 ```
+
+For offline package changes, run:
+
+```bash
+bun test scripts/offline-package.test.ts scripts/native-release-manifest.test.ts
+```
+
+Before closing a release, inspect the asset list for the Windows, Ubuntu 24, and
+Kylin V10 offline archives. Kylin V10 currently means x86_64 unless the owner
+explicitly requests an ARM64/aarch64 package.
 
 ## Documentation Maintenance
 
