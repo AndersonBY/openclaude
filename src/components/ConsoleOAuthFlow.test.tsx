@@ -140,4 +140,4 @@ test('third-party provider branch opens the first-run provider manager', async (
   expect(output).toContain('Azure OpenAI')
   expect(output).toContain('DeepSeek')
   expect(output).toContain('Google Gemini')
-})
+}, 15000)

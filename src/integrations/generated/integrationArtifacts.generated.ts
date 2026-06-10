@@ -3,6 +3,7 @@
 
 import type { AnthropicProxyDescriptor, BrandDescriptor, GatewayDescriptor, ModelDescriptor, ProviderPresetManifestEntry, VendorDescriptor } from '../descriptors.js'
 import vendorAnthropic from '../vendors/anthropic.js'
+import vendorAtlasCloud from '../vendors/atlas-cloud.js'
 import vendorBankr from '../vendors/bankr.js'
 import vendorDeepseek from '../vendors/deepseek.js'
 import vendorGemini from '../vendors/gemini.js'
@@ -63,7 +64,7 @@ import modelQwen from '../models/qwen.js'
 import modelXai from '../models/xai.js'
 import modelXiaomiMimo from '../models/xiaomi-mimo.js'
 
-export const VENDOR_DESCRIPTORS = [vendorAnthropic, vendorBankr, vendorDeepseek, vendorGemini, vendorMinimax, vendorMoonshot, vendorOpenai, vendorVenice, vendorXai, vendorXiaomiMimo, vendorZai] as const satisfies readonly VendorDescriptor[]
+export const VENDOR_DESCRIPTORS = [vendorAnthropic, vendorAtlasCloud, vendorBankr, vendorDeepseek, vendorGemini, vendorMinimax, vendorMoonshot, vendorOpenai, vendorVenice, vendorXai, vendorXiaomiMimo, vendorZai] as const satisfies readonly VendorDescriptor[]
 export const GATEWAY_DESCRIPTORS = [gatewayAtomicChat, gatewayAzureOpenai, gatewayBedrock, gatewayCustom, gatewayDashscopeCn, gatewayDashscopeIntl, gatewayGithub, gatewayGitlawbOpengateway, gatewayGroq, gatewayHicap, gatewayKimiCode, gatewayLmstudio, gatewayMistral, gatewayNvidiaNim, gatewayOllama, gatewayOpencodeGo, gatewayOpencode, gatewayOpenrouter, gatewayTogether, gatewayVertex] as const satisfies readonly GatewayDescriptor[]
 export const ANTHROPIC_PROXY_DESCRIPTORS = [] as const satisfies readonly AnthropicProxyDescriptor[]
 export const BRAND_DESCRIPTORS = [brandClaude, brandDeepseek, brandGemini, brandGlm, brandGpt, brandKimi, brandLlama, brandMinimax, brandMistral, brandNemotron, brandOpenaiCompatibleAlias, brandQwen, brandXai, brandXiaomiMimo] as const satisfies readonly BrandDescriptor[]
@@ -133,6 +134,20 @@ export const PROVIDER_PRESET_MANIFEST = [
     "description": "Alibaba DashScope International endpoint",
     "apiKeyEnvVars": [
       "DASHSCOPE_API_KEY"
+    ]
+  },
+  {
+    "preset": "atlas-cloud",
+    "routeKind": "vendor",
+    "routeId": "atlas-cloud",
+    "vendorId": "atlas-cloud",
+    "description": "Atlas Cloud AI (OpenAI-compatible)",
+    "apiKeyEnvVars": [
+      "ATLAS_CLOUD_API_KEY"
+    ],
+    "modelEnvVars": [
+      "ATLAS_CLOUD_MODEL",
+      "OPENAI_MODEL"
     ]
   },
   {
@@ -309,7 +324,7 @@ export const PROVIDER_PRESET_MANIFEST = [
     "routeId": "opencode-go",
     "vendorId": "openai",
     "gatewayId": "opencode-go",
-    "description": "OpenCode Go — $10/mo subscription for open models (12 models)",
+    "description": "OpenCode Go — $10/mo subscription for open models (13 models)",
     "apiKeyEnvVars": [
       "OPENCODE_API_KEY"
     ],
@@ -323,7 +338,7 @@ export const PROVIDER_PRESET_MANIFEST = [
     "routeId": "opencode",
     "vendorId": "openai",
     "gatewayId": "opencode",
-    "description": "OpenCode Zen — pay-as-you-go AI gateway (41 models)",
+    "description": "OpenCode Zen — pay-as-you-go AI gateway (43 models)",
     "apiKeyEnvVars": [
       "OPENCODE_API_KEY"
     ],
@@ -441,6 +456,7 @@ export const ORDERED_PROVIDER_PRESETS = [
   "anthropic",
   "dashscope-cn",
   "dashscope-intl",
+  "atlas-cloud",
   "azure-openai",
   "bankr",
   "deepseek",
