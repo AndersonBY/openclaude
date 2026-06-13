@@ -27,9 +27,8 @@ const REVIEW_WORKFLOW_PATH =
 
 const execCalls: ExecCall[] = []
 const openedUrls: string[] = []
-let initialSetupCount: number | undefined
+let setupConfig: GlobalConfig
 let realModules: RealModules | undefined
-let testGlobalConfig: GlobalConfig
 
 function execResult(stdout = '', code = 0, stderr = '') {
   return {
@@ -175,11 +174,11 @@ function handleGhCommand(args: string[]) {
 function installMocks(real: RealModules): void {
   const configMock = {
     ...real.config,
-    getGlobalConfig: () => testGlobalConfig,
+    getGlobalConfig: () => setupConfig,
     saveGlobalConfig: (
       updater: (currentConfig: GlobalConfig) => GlobalConfig,
     ) => {
-      testGlobalConfig = updater(testGlobalConfig)
+      setupConfig = updater(setupConfig)
     },
   }
 
@@ -217,18 +216,12 @@ beforeEach(async () => {
   )
   execCalls.length = 0
   openedUrls.length = 0
-  const real = await importRealModules()
-  testGlobalConfig = {
-    ...real.config.getGlobalConfig(),
-    githubActionSetupCount: undefined,
-  }
-  initialSetupCount = testGlobalConfig.githubActionSetupCount
-  installMocks(real)
+  setupConfig = { numStartups: 0, githubActionSetupCount: 0 } as GlobalConfig
+  installMocks(await importRealModules())
 })
 
 afterEach(() => {
   try {
-    initialSetupCount = undefined
     mock.restore()
     if (realModules) {
       mock.module('src/utils/config.js', () => realModules!.config)
@@ -268,9 +261,7 @@ test('setupGitHubActions creates only the selected review workflow', async () =>
   expect(openedUrls[0]).toContain(
     'https://github.com/owner/repo/compare/main...add-claude-github-actions-',
   )
-  expect(testGlobalConfig.githubActionSetupCount).toBe(
-    (initialSetupCount ?? 0) + 1,
-  )
+  expect(setupConfig.githubActionSetupCount).toBe(1)
 })
 
 test('setupGitHubActions skip mode configures the secret without workflow writes', async () => {
@@ -298,7 +289,5 @@ test('setupGitHubActions skip mode configures the secret without workflow writes
   expect(openedUrls).toHaveLength(0)
   expect(secretSet?.args).toContain('CLAUDE_CODE_OAUTH_TOKEN')
   expect(secretSet?.args).toContain('oauth-token')
-  expect(testGlobalConfig.githubActionSetupCount).toBe(
-    (initialSetupCount ?? 0) + 1,
-  )
+  expect(setupConfig.githubActionSetupCount).toBe(1)
 })

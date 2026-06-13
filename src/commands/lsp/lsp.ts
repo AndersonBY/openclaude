@@ -723,9 +723,10 @@ function filterDiscoveredRecommendationExtensions(
 export async function discoverWorkspaceExtensions(
   pathspec?: string,
   cwd = getCwd(),
+  execFile = execFileNoThrowWithCwd,
 ): Promise<string[]> {
   const args = pathspec ? ['ls-files', '--', pathspec] : ['ls-files']
-  const result = await execFileNoThrowWithCwd(gitExe(), args, {
+  const result = await execFile(gitExe(), args, {
     cwd,
     timeout: 5_000,
     maxBuffer: 2 * 1024 * 1024,

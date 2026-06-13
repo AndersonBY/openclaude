@@ -1,13 +1,4 @@
 import { feature } from 'bun:bundle';
-import {
-  applyProfileEnvToProcessEnv,
-  buildStartupEnvFromProfile,
-  isDefaultStartupProviderEnv,
-} from '../utils/providerProfile.js'
-import {
-  getProviderValidationError,
-  validateProviderEnvForStartupOrExit,
-} from '../utils/providerValidation.js'
 
 // OpenClaude: polyfill globalThis.File for Node < 20.
 // undici v7 references `File` at module evaluation time (webidl type
@@ -20,7 +11,6 @@ if (typeof globalThis.File === 'undefined') {
     // Node 18.13+ exposes File in node:buffer but not as a global.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { File: NodeFile } = require('node:buffer')
-    // @ts-expect-error -- polyfilling missing global
     globalThis.File = NodeFile
   } catch {
     // Absolute fallback: stub so `MakeTypeAssertion(File)` doesn't throw.
@@ -114,10 +104,18 @@ async function main(): Promise<void> {
     applySafeConfigEnvironmentVariables()
   }
 
+  const {
+    applyProfileEnvToProcessEnv,
+    buildStartupEnvFromProfile,
+    isDefaultStartupProviderEnv,
+  } = await import('../utils/providerProfile.js')
   const startupEnv = await buildStartupEnvFromProfile({
     processEnv: process.env,
   })
   if (startupEnv !== process.env) {
+    const { getProviderValidationError } = await import(
+      '../utils/providerValidation.js'
+    )
     const startupProfileError = await getProviderValidationError(startupEnv)
     if (startupProfileError && !isDefaultStartupProviderEnv(startupEnv)) {
       console.error(
@@ -170,6 +168,9 @@ async function main(): Promise<void> {
     hydrateGithubModelsTokenFromSecureStorage()
   }
 
+  const { validateProviderEnvForStartupOrExit } = await import(
+    '../utils/providerValidation.js'
+  )
   await validateProviderEnvForStartupOrExit()
 
   // #808: --model alone (no --provider) — route to the env var matching the

@@ -44,7 +44,7 @@ import {
   type ResolvedProfileRoute,
   type ProviderPreset,
 } from '../integrations/index.js'
-import { resolveEnvOnlyProviderRouteId } from '../integrations/routeMetadata.js'
+import { isFireworksBaseUrl, isNearaiBaseUrl, resolveEnvOnlyProviderRouteId } from '../integrations/routeMetadata.js'
 import { logForDebugging } from './debug.js'
 import {
   sanitizeProfileCustomHeaders,
@@ -553,6 +553,14 @@ function isProcessEnvAlignedWithProfile(
     (profile.baseUrl?.toLowerCase().includes('atlascloud')
       ? !includeApiKey ||
         sameOptionalEnvValue(processEnv.ATLAS_CLOUD_API_KEY, profile.apiKey)
+      : true) &&
+    (isNearaiBaseUrl(profile.baseUrl)
+      ? !includeApiKey ||
+        sameOptionalEnvValue(processEnv.NEARAI_API_KEY, profile.apiKey)
+      : true) &&
+    (isFireworksBaseUrl(profile.baseUrl)
+      ? !includeApiKey ||
+        sameOptionalEnvValue(processEnv.FIREWORKS_API_KEY, profile.apiKey)
       : true)
   )
 }
@@ -690,6 +698,12 @@ export function applyProviderProfileToProcessEnv(profile: ProviderProfile): void
       }
       if (route.routeId === 'atlas-cloud' || profile.baseUrl.toLowerCase().includes('atlascloud')) {
         openAIProfileEnv.ATLAS_CLOUD_API_KEY = profile.apiKey
+      }
+      if (route.routeId === 'nearai' || isNearaiBaseUrl(profile.baseUrl)) {
+        openAIProfileEnv.NEARAI_API_KEY = profile.apiKey
+      }
+      if (route.routeId === 'fireworks' || isFireworksBaseUrl(profile.baseUrl)) {
+        openAIProfileEnv.FIREWORKS_API_KEY = profile.apiKey
       }
     }
     if (route.gatewayId === 'nvidia-nim') {
@@ -936,6 +950,12 @@ function buildOpenAICompatibleStartupEnv(
       if (activeProfile.baseUrl?.toLowerCase().includes('atlascloud')) {
         strictEnv.ATLAS_CLOUD_API_KEY = activeProfile.apiKey
       }
+      if (isNearaiBaseUrl(activeProfile.baseUrl)) {
+        strictEnv.NEARAI_API_KEY = activeProfile.apiKey
+      }
+      if (isFireworksBaseUrl(activeProfile.baseUrl)) {
+        strictEnv.FIREWORKS_API_KEY = activeProfile.apiKey
+      }
       return applySupportedProfileCustomHeaders(activeProfile, strictEnv)
     }
   }
@@ -943,19 +963,12 @@ function buildOpenAICompatibleStartupEnv(
   const env: ProfileEnv = {
     OPENAI_BASE_URL: activeProfile.baseUrl,
     OPENAI_MODEL: getPrimaryModel(activeProfile.model),
+    ...(activeProfile.apiFormat ? { OPENAI_API_FORMAT: activeProfile.apiFormat } : {}),
+    ...(activeProfile.authHeader ? { OPENAI_AUTH_HEADER: activeProfile.authHeader } : {}),
+    ...(activeProfile.authScheme ? { OPENAI_AUTH_SCHEME: activeProfile.authScheme } : {}),
+    ...(activeProfile.authHeaderValue ? { OPENAI_AUTH_HEADER_VALUE: activeProfile.authHeaderValue } : {}),
   }
-  if (activeProfile.apiFormat) {
-    env.OPENAI_API_FORMAT = activeProfile.apiFormat
-  }
-  if (activeProfile.authHeader) {
-    env.OPENAI_AUTH_HEADER = activeProfile.authHeader
-    env.OPENAI_AUTH_SCHEME = activeProfile.authScheme ?? (
-      activeProfile.authHeader.toLowerCase() === 'authorization' ? 'bearer' : 'raw'
-    )
-    if (activeProfile.authHeaderValue) {
-      env.OPENAI_AUTH_HEADER_VALUE = activeProfile.authHeaderValue
-    }
-  }
+
   if (activeProfile.apiKey) {
     env.OPENAI_API_KEY = activeProfile.apiKey
     if (activeProfile.baseUrl?.toLowerCase().includes('bankr')) {
@@ -975,6 +988,12 @@ function buildOpenAICompatibleStartupEnv(
     }
     if (activeProfile.baseUrl?.toLowerCase().includes('atlascloud')) {
       env.ATLAS_CLOUD_API_KEY = activeProfile.apiKey
+    }
+    if (isNearaiBaseUrl(activeProfile.baseUrl)) {
+      env.NEARAI_API_KEY = activeProfile.apiKey
+    }
+    if (isFireworksBaseUrl(activeProfile.baseUrl)) {
+      env.FIREWORKS_API_KEY = activeProfile.apiKey
     }
   } else {
     delete env.OPENAI_API_KEY
@@ -1127,6 +1146,11 @@ function buildStartupProfileFromActiveProfile(
         return env
           ? { profile: 'openai', env: applySupportedProfileCustomHeaders(activeProfile, env) }
           : null
+      }
+
+      if (route.vendorId === 'nearai') {
+        const env = buildOpenAICompatibleStartupEnv(activeProfile)
+        return env ? { profile: 'openai', env } : null
       }
 
       // xAI OAuth profile (provider=xai with no API key). Tag the startup
