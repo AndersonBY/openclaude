@@ -48,7 +48,7 @@ export function MemoryFileSelector(t0) {
     onSelect,
     onCancel
   } = t0;
-  const existingMemoryFiles = use(getMemoryFiles());
+  const existingMemoryFiles = use(getMemoryFiles()) as MemoryFileInfo[];
   const originalCwd = getOriginalCwd();
   const userMemoryPath = join(getClaudeConfigHomeDir(), "CLAUDE.md");
   const projectMemoryPath = getProjectMemoryPathForSelector(existingMemoryFiles, originalCwd);
@@ -90,7 +90,7 @@ export function MemoryFileSelector(t0) {
     let description;
     const isGit = projectIsInGitRepo(originalCwd);
     if (file.type === "User" && !file.isNested) {
-      description = "Saved in ~/.claude/CLAUDE.md";
+      description = `Saved in ${getDisplayPath(userMemoryPath)}`;
     } else {
       if (file.type === "Project" && !file.isNested && file.path === projectMemoryPath) {
         description = `${isGit ? "Checked in at" : "Saved in"} ./${projectMemoryFileName}`;

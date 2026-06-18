@@ -33,6 +33,8 @@ const RESTORED_KEYS = [
   'OPENAI_AUTH_SCHEME',
   'OPENAI_AUTH_HEADER_VALUE',
   'OPENAI_API_KEY',
+  'GITHUB_COPILOT_KEY',
+  'GITHUB_ENTERPRISE_URL',
   'CODEX_API_KEY',
   'CODEX_CREDENTIAL_SOURCE',
   'CHATGPT_ACCOUNT_ID',
@@ -63,6 +65,7 @@ const RESTORED_KEYS = [
   'MIMO_API_KEY',
   'ATLAS_CLOUD_API_KEY',
   'HICAP_API_KEY',
+  'CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS',
 ] as const
 
 type MockConfigState = {
@@ -338,6 +341,141 @@ describe('applyProviderProfileToProcessEnv', () => {
     )
     expect(process.env.OPENAI_MODEL).toBe('github:copilot')
     expect(getFreshAPIProvider()).toBe('github')
+  })
+
+  test('github-enterprise profile uses GitHub compatibility env', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CLAUDE_CODE_USE_OPENAI = '1'
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'github-enterprise',
+        baseUrl: 'https://github.mycompany.com/api/copilot',
+        model: 'github:copilot:gpt-5.3-codex',
+        apiKey: 'enterprise-profile-key',
+      }),
+    )
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+    const { resolveProviderRequest } = await import(
+      `../services/api/providerConfig.ts?ts=${Date.now()}-${Math.random()}`
+    )
+
+    expect(process.env.CLAUDE_CODE_USE_GITHUB).toBe('1')
+    expect(process.env.CLAUDE_CODE_USE_OPENAI).toBeUndefined()
+    expect(process.env.OPENAI_BASE_URL).toBe(
+      'https://github.mycompany.com/api/copilot',
+    )
+    expect(process.env.GITHUB_ENTERPRISE_URL).toBe(
+      'https://github.mycompany.com',
+    )
+    expect(process.env.GITHUB_COPILOT_KEY).toBe('enterprise-profile-key')
+    expect(process.env.OPENAI_MODEL).toBe('github:copilot:gpt-5.3-codex')
+    expect(getFreshAPIProvider()).toBe('github')
+    expect(resolveProviderRequest()).toMatchObject({
+      baseUrl: 'https://github.mycompany.com/api/copilot',
+      resolvedModel: 'gpt-5.3-codex',
+      transport: 'codex_responses',
+    })
+  })
+
+  test('github-enterprise profile does not derive Enterprise URL from public Copilot default', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'github-enterprise',
+        baseUrl: 'https://api.githubcopilot.com',
+        model: 'github:copilot:gpt-5.3-codex',
+      }),
+    )
+
+    expect(process.env.CLAUDE_CODE_USE_GITHUB).toBe('1')
+    expect(process.env.OPENAI_BASE_URL).toBe('https://api.githubcopilot.com')
+    expect(process.env.GITHUB_ENTERPRISE_URL).toBeUndefined()
+  })
+
+  test('github-enterprise profile remains aligned only with Enterprise env', async () => {
+    const {
+      applyActiveProviderProfileFromConfig,
+      applyProviderProfileToProcessEnv,
+    } = await importFreshProviderProfileModules()
+    const activeProfile = buildProfile({
+      id: 'github_enterprise_prof',
+      provider: 'github-enterprise',
+      baseUrl: 'https://github.mycompany.com/api/copilot',
+      model: 'github:copilot:gpt-5.3-codex',
+      apiKey: 'enterprise-profile-key',
+    })
+
+    applyProviderProfileToProcessEnv(activeProfile)
+    const unchanged = applyActiveProviderProfileFromConfig({
+      providerProfiles: [activeProfile],
+      activeProviderProfileId: activeProfile.id,
+    } as any)
+
+    expect(unchanged?.id).toBe(activeProfile.id)
+    expect(process.env.GITHUB_ENTERPRISE_URL).toBe(
+      'https://github.mycompany.com',
+    )
+
+    delete process.env.GITHUB_ENTERPRISE_URL
+    const updated = applyActiveProviderProfileFromConfig({
+      providerProfiles: [activeProfile],
+      activeProviderProfileId: activeProfile.id,
+    } as any)
+
+    expect(updated?.id).toBe(activeProfile.id)
+    expect(String(process.env.GITHUB_ENTERPRISE_URL)).toBe(
+      'https://github.mycompany.com',
+    )
+  })
+
+  test('github-enterprise profile persists and relaunches with Enterprise env', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const enterpriseProfile = buildProfile({
+        id: 'github_enterprise_persisted',
+        name: 'GitHub Enterprise',
+        provider: 'github-enterprise',
+        baseUrl: 'https://github.mycompany.com/api/copilot',
+        model: 'github:copilot:gpt-5.3-codex',
+        apiKey: 'enterprise-profile-key',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [enterpriseProfile],
+      }))
+
+      const result = setActiveProviderProfile('github_enterprise_persisted', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('github_enterprise_persisted')
+      expect(persisted.profile).toBe('github-enterprise')
+      expect(persisted.env).toMatchObject({
+        GITHUB_ENTERPRISE_URL: 'https://github.mycompany.com',
+        GITHUB_COPILOT_KEY: 'enterprise-profile-key',
+        OPENAI_BASE_URL: 'https://github.mycompany.com/api/copilot',
+        OPENAI_MODEL: 'github:copilot:gpt-5.3-codex',
+      })
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
   })
 
   test('nvidia-nim profile keeps openai-compatible routing but stamps NVIDIA_NIM', async () => {
@@ -778,6 +916,106 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(String(process.env.XAI_API_KEY)).toBe('xai-test-key')
     expect(getFreshAPIProvider()).toBe('xai')
   })
+
+  test('does not mirror XAI_API_KEY for a lookalike host containing "x.ai"', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    // `vertex.ai` contains the substring "x.ai"; a raw includes() check would
+    // wrongly treat this OpenAI-compatible profile as xAI and mirror the key
+    // into XAI_API_KEY. Host matching must be by hostname (api.x.ai), not
+    // substring.
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'openai',
+        baseUrl: 'https://vertex.ai/v1',
+        model: 'some-model',
+        apiKey: 'not-an-xai-key',
+      }),
+    )
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.XAI_API_KEY).toBeUndefined()
+    expect(process.env.OPENAI_API_KEY).toBe('not-an-xai-key')
+    expect(getFreshAPIProvider()).not.toBe('xai')
+  })
+
+  test('openai-compatible profile applies maxContextLength env override', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'custom',
+        baseUrl: 'http://localhost:4000/v1',
+        model: 'gpt-4o',
+        maxContextLength: 200_000,
+      }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('http://localhost:4000/v1')
+    expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
+    expect(process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS).toBe(
+      JSON.stringify({ 'gpt-4o': 200_000 }),
+    )
+  })
+
+  test('openai-compatible profile switch clears previous same-model context override', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    const { resolveModelRuntimeLimits } = await import(
+      '../integrations/runtimeMetadata.js'
+    )
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'custom',
+        baseUrl: 'http://localhost:4000/v1',
+        model: 'gpt-4o',
+        maxContextLength: 1_000_000,
+      }),
+    )
+    expect(
+      resolveModelRuntimeLimits({
+        model: 'gpt-4o',
+        processEnv: process.env,
+      }).contextWindow,
+    ).toBe(1_000_000)
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o',
+      }),
+    )
+
+    expect(process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS).toBeUndefined()
+    expect(
+      resolveModelRuntimeLimits({
+        model: 'gpt-4o',
+        processEnv: process.env,
+      }).contextWindow,
+    ).not.toBe(1_000_000)
+  })
+
+  test('non-openai-compatible profile ignores maxContextLength override', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'anthropic',
+        baseUrl: 'https://api.anthropic.com',
+        model: 'claude-sonnet-4-6',
+        maxContextLength: 200_000,
+      }),
+    )
+
+    expect(process.env.ANTHROPIC_MODEL).toBe('claude-sonnet-4-6')
+    expect(process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS).toBeUndefined()
+  })
 })
 
 describe('getProviderProfiles', () => {
@@ -801,6 +1039,34 @@ describe('getProviderProfiles', () => {
 
     expect(profiles).toHaveLength(1)
     expect(profiles[0]?.provider).toBe('moonshot')
+  })
+
+  test('sanitizes maxContextLength to positive finite integers', async () => {
+    const { getProviderProfiles } = await importFreshProviderProfileModules()
+
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [
+        buildProfile({ id: 'valid', maxContextLength: 128_000 }),
+        buildProfile({ id: 'negative', maxContextLength: -1 }),
+        buildProfile({ id: 'float', maxContextLength: 128_000.5 }),
+        buildProfile({ id: 'zero', maxContextLength: 0 }),
+        buildProfile({ id: 'infinity', maxContextLength: Infinity }),
+        buildProfile({ id: 'string', maxContextLength: '128000' as unknown as number }),
+        buildProfile({ id: 'missing' }),
+      ],
+    }))
+
+    const profiles = getProviderProfiles()
+
+    const byId = (id: string) => profiles.find(p => p.id === id)
+    expect(byId('valid')?.maxContextLength).toBe(128_000)
+    expect(byId('negative')?.maxContextLength).toBeUndefined()
+    expect(byId('float')?.maxContextLength).toBeUndefined()
+    expect(byId('zero')?.maxContextLength).toBeUndefined()
+    expect(byId('infinity')?.maxContextLength).toBeUndefined()
+    expect(byId('string')?.maxContextLength).toBeUndefined()
+    expect(byId('missing')?.maxContextLength).toBeUndefined()
   })
 })
 
@@ -921,6 +1187,36 @@ describe('applyActiveProviderProfileFromConfig', () => {
     expect(process.env.OPENAI_MODEL).toBe('gpt-4o-mini')
   })
 
+  test('respects env-only GitHub Enterprise startup selection', async () => {
+    const { applyActiveProviderProfileFromConfig } =
+      await importFreshProviderProfileModules()
+    process.env.CLAUDE_CODE_USE_GITHUB = '1'
+    process.env.GITHUB_ENTERPRISE_URL = 'https://github.mycompany.com/api/copilot'
+    process.env.GITHUB_COPILOT_KEY = 'enterprise-direct-key'
+    delete process.env.OPENAI_MODEL
+
+    const applied = applyActiveProviderProfileFromConfig({
+      providerProfiles: [
+        buildProfile({
+          id: 'saved_openai',
+          baseUrl: 'https://api.openai.com/v1',
+          model: 'gpt-4o',
+        }),
+      ],
+      activeProviderProfileId: 'saved_openai',
+    } as any)
+
+    expect(applied).toBeUndefined()
+    expect(process.env.CLAUDE_CODE_USE_GITHUB).toBe('1')
+    expect(process.env.GITHUB_ENTERPRISE_URL).toBe(
+      'https://github.mycompany.com/api/copilot',
+    )
+    expect(process.env.GITHUB_COPILOT_KEY).toBe('enterprise-direct-key')
+    expect(process.env.CLAUDE_CODE_USE_OPENAI).toBeUndefined()
+    expect(process.env.OPENAI_BASE_URL).toBeUndefined()
+    expect(process.env.OPENAI_MODEL).toBeUndefined()
+  })
+
   test('does not override explicit env-only MiniMax selection with saved profile', async () => {
     const { applyActiveProviderProfileFromConfig } =
       await importFreshProviderProfileModules()
@@ -1002,6 +1298,34 @@ describe('applyActiveProviderProfileFromConfig', () => {
     expect(applied?.id).toBe('saved_openai')
     expect(process.env.OPENAI_MODEL).toBe('kimi-k2.5:cloud')
     expect(process.env.OPENAI_BASE_URL).toBe('http://192.168.33.108:11434/v1')
+  })
+
+  test('re-applies active profile when context-window override drifts', async () => {
+    const { applyActiveProviderProfileFromConfig, applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    const activeProfile = buildProfile({
+      id: 'saved_openai',
+      baseUrl: 'http://localhost:4000/v1',
+      model: 'gpt-4o',
+      maxContextLength: 1_000_000,
+    })
+    applyProviderProfileToProcessEnv(activeProfile)
+
+    // Simulate an upgraded or partially restored process where the profile
+    // marker and core OpenAI env survived, but this PR's new override did not.
+    delete process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS
+
+    const applied = applyActiveProviderProfileFromConfig({
+      providerProfiles: [activeProfile],
+      activeProviderProfileId: 'saved_openai',
+    } as any)
+
+    expect(applied?.id).toBe('saved_openai')
+    expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
+    expect(process.env.OPENAI_BASE_URL).toBe('http://localhost:4000/v1')
+    expect(String(process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS)).toBe(
+      JSON.stringify({ 'gpt-4o': 1_000_000 }),
+    )
   })
 
   test('does not re-apply active profile when flags conflict with current provider', async () => {

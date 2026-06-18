@@ -70,6 +70,9 @@ OpenClaude is also mirrored to GitLawb:
 
 ### Install
 
+OpenClaude requires Node.js `>=22.0.0` for npm installs and runtime. Bun is
+only needed for source builds and local development.
+
 ```bash
 npm install -g @makerbi/openclaude@latest
 ```
@@ -94,6 +97,34 @@ Inside OpenClaude:
 
 - run `/provider` for guided provider setup and saved profiles
 - run `/onboard-github` for GitHub Models onboarding
+
+> **Note:** OpenClaude does not automatically load project `.env` files. We recommend using the `/provider` command for setup, which securely stores credentials. If you prefer environment variables, export them explicitly or run `openclaude --provider-env-file .env` for provider/setup variables. Export runtime/debug knobs from your shell or launcher.
+
+### Background sessions
+
+Run long non-interactive prompts detached from the current terminal:
+
+```bash
+openclaude --bg "fix failing tests"
+openclaude --bg --name auth-refactor "refactor auth middleware"
+openclaude ps
+openclaude logs auth-refactor
+openclaude logs auth-refactor -f
+openclaude kill auth-refactor
+```
+
+Background sessions are local child processes. OpenClaude does not start a daemon
+or network service, and permission/provider/model/settings flags are passed to
+the child process the same way they are for a foreground `--print` run. Session
+metadata and logs are stored under the resolved OpenClaude config directory,
+usually `~/.openclaude/bg-sessions/`; `OPENCLAUDE_CONFIG_DIR` can point
+OpenClaude somewhere else, with `CLAUDE_CONFIG_DIR` still supported as the
+legacy fallback. Session names can be reused after older sessions reach a
+terminal state; use the session ID to inspect older logs with the same name.
+
+`openclaude attach <id-or-name>` currently reports the matching session and
+points to `openclaude logs <id> -f`; full terminal reattach is not implemented
+for local background sessions yet.
 
 ### Fastest OpenAI setup
 
@@ -192,6 +223,21 @@ OpenClaude supports multiple providers, but behavior is not identical across all
 - Gitlawb Opengateway is the fresh-install startup default and requires an API key from https://gitlawb.com/opengateway/keys. It uses one OpenAI-compatible base URL; switch between `mimo-*` and `google/gemini-3.1-flash-lite-preview` with `/model`, and do not pin the base URL to `/v1/xiaomi-mimo`.
 - Xiaomi MiMo uses `api-key` header auth on the direct OpenAI-compatible route and currently does not support `/usage` reporting in OpenClaude
 
+### GitHub Copilot sub-agent optimization
+
+When CLAUDE_CODE_USE_GITHUB=1, OpenClaude serializes sub-agent execution to reduce GitHub Copilot Premium Request consumption. Default behavior is GITHUB_COPILOT_MAX_SUBAGENTS=1 (synchronous, one sub-agent at a time). Tuning vars (all optional):
+
+| Var | Effect |
+|---|---|
+| GITHUB_COPILOT_MAX_SUBAGENTS=0 | Suppress sub-agents entirely (sub-agents throw an error). |
+| GITHUB_COPILOT_MAX_SUBAGENTS=1 | Force synchronous execution. **Default.** |
+| GITHUB_COPILOT_MAX_SUBAGENTS=2..10 | Parsed/clamped but not enforced differently from =1 (any positive cap = synchronous). |
+| GITHUB_COPILOT_ALLOW_SUBAGENTS=1 | Re-enable parallel/background sub-agents, overriding the cap. |
+| GITHUB_COPILOT_FORCE_SYNC_SUBAGENTS=1 | Force synchronous execution regardless of cap. |
+| GITHUB_COPILOT_OPTIMIZATION_DISABLED=1 | Disable all of the above; sub-agents run as before this feature. |
+
+The `is_async` field reported in the `tengu_agent_tool_selected` event and the agent metadata now reflects the final execution mode (i.e., `false` when synchronous is forced). See `.env.example` for the full descriptions.
+
 For best results, use models with strong tool/function calling support.
 
 ## Agent Routing
@@ -234,6 +280,21 @@ When no routing match is found, the global provider remains the fallback.
 > **Note:** `/provider` changes the global/parent provider for your current session. `agentModels` and `agentRouting` are specifically for configuring per-agent provider overrides while keeping the parent session unchanged.
 
 > **Note:** `api_key` values in `settings.json` are stored in plaintext. Keep this file private and do not commit it to version control.
+
+**Model-only routes (same provider):** Omit `base_url` and `api_key` to run an agent on a different model using your *current* provider's endpoint and key — no credential duplication:
+
+```json
+{
+  "agentModels": {
+    "mini": { "model": "gpt-5-mini" }
+  },
+  "agentRouting": {
+    "verification": "mini"
+  }
+}
+```
+
+**Built-in agents are routable by their type name.** Useful keys: `verification` (the read-only auditor that runs before completion), `Explore`, and `Plan`. For example, `"agentRouting": { "verification": "mini" }` runs the verifier on `gpt-5-mini` while your main session stays on its model. Absent any entry, the verifier inherits the main-loop model.
 
 ## Web Search and Fetch
 
@@ -294,6 +355,8 @@ npm run dev:grpc:cli
 ---
 
 ## Source Build And Local Development
+
+Use Node.js `>=22.0.0` and Bun `1.3.13` or newer for source builds.
 
 ```bash
 bun install
@@ -397,4 +460,4 @@ OpenClaude originated from the Claude Code codebase and has since been substanti
 
 ## License
 
-See [LICENSE](LICENSE).
+MIT for OpenClaude contributors' modifications; the derived Claude Code remains Anthropic's. [See more](LICENSE).

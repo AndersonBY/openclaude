@@ -11,7 +11,7 @@ import * as path from 'node:path'
 type FakeChildProcess = EventEmitter & {
   stdout: EventEmitter
   stderr: EventEmitter
-  kill: () => boolean
+  kill: (signal?: NodeJS.Signals | number) => boolean
 }
 
 type LoadModuleOptions = {
@@ -28,6 +28,17 @@ let actualCrossSpawnModule:
   | typeof import('cross-spawn')
   | undefined
 let actualRipgrepModule: typeof import('../utils/ripgrep.js') | undefined
+
+// The `cross-spawn` mock is installed via `mock.module`, which bun does NOT
+// undo on `mock.restore()` — it persists process-wide. To keep it from
+// hijacking real `git` spawns in later test files (which run sequentially),
+// the interception is gated on this module-level scenario, set only while one
+// of this suite's spawn-scenario tests is active and cleared in afterEach. Once
+// cleared, the persisted mock falls through to the real spawn.
+let activeSpawnScenario: LoadModuleOptions['spawnScenario'] | undefined
+let actualFileIndexModule:
+  | typeof import('../native-ts/file-index/index.js')
+  | undefined
 let actualMarkdownConfigLoaderModule:
   | typeof import('../utils/markdownConfigLoader.js')
   | undefined
@@ -35,15 +46,12 @@ let defaultFileSuggestionsModule:
   | Awaited<ReturnType<typeof loadFileSuggestionsModule>>
   | undefined
 
-function restoreDependencyMocks(): void {
-  mock.restore()
-  if (actualCrossSpawnModule) {
-    mock.module('cross-spawn', () => actualCrossSpawnModule!)
-  }
-}
-
 afterEach(() => {
-  restoreDependencyMocks()
+  // Clear the spawn scenario so the persisted cross-spawn mock falls through to
+  // the real spawn for any later test file's git commands.
+  activeSpawnScenario = undefined
+  mock.restore()
+  restoreFileSuggestionsDependencyMocks()
 })
 
 beforeAll(
@@ -63,11 +71,27 @@ function createFakeChildProcess(): FakeChildProcess {
   const child = new EventEmitter() as FakeChildProcess
   child.stdout = new EventEmitter()
   child.stderr = new EventEmitter()
-  child.kill = () => {
+  // A real ChildProcess exposes kill(); callers (e.g. execFileNoThrow's
+  // timeout path) call it. Provide it so a foreign caller that ever reaches
+  // this fake child terminates cleanly instead of throwing
+  // "child.kill is not a function". Emit close so the caller stops waiting.
+  child.kill = (() => {
     queueMicrotask(() => child.emit('close', null, 'SIGTERM'))
     return true
-  }
+  }) as FakeChildProcess['kill']
   return child
+}
+
+function restoreFileSuggestionsDependencyMocks(): void {
+  if (actualCrossSpawnModule) {
+    mock.module('cross-spawn', () => actualCrossSpawnModule!)
+  }
+  if (actualRipgrepModule) {
+    mock.module('../utils/ripgrep.js', () => actualRipgrepModule!)
+  }
+  if (actualFileIndexModule) {
+    mock.module('../native-ts/file-index/index.js', () => actualFileIndexModule!)
+  }
 }
 
 function createIgnoreModuleMock() {
@@ -119,11 +143,11 @@ function installFileSuggestionsDependencyMocks(options: LoadModuleOptions = {}):
       args: string[],
       spawnOptions: { signal?: AbortSignal },
     ) => {
-      if (!options.spawnScenario || !isGitCommand(command)) {
+      if (!activeSpawnScenario || !isGitCommand(command)) {
         return realSpawn(command, args, spawnOptions)
       }
       const child = createFakeChildProcess()
-      options.spawnScenario?.(child, spawnOptions.signal)
+      activeSpawnScenario(child, spawnOptions.signal)
       return child
     },
     spawn: (
@@ -131,11 +155,11 @@ function installFileSuggestionsDependencyMocks(options: LoadModuleOptions = {}):
       args: string[],
       spawnOptions: { signal?: AbortSignal },
     ) => {
-      if (!options.spawnScenario || !isGitCommand(command)) {
+      if (!activeSpawnScenario || !isGitCommand(command)) {
         return realSpawn(command, args, spawnOptions)
       }
       const child = createFakeChildProcess()
-      options.spawnScenario?.(child, spawnOptions.signal)
+      activeSpawnScenario(child, spawnOptions.signal)
       return child
     },
   }))
@@ -163,15 +187,17 @@ function installFileSuggestionsDependencyMocks(options: LoadModuleOptions = {}):
 }
 
 async function loadFileSuggestionsModule(options: LoadModuleOptions = {}) {
+  activeSpawnScenario = options.spawnScenario
   actualCrossSpawnModule ??= await import('cross-spawn')
   actualRipgrepModule ??= await import('../utils/ripgrep.js')
+  actualFileIndexModule ??= await import('../native-ts/file-index/index.js')
   actualMarkdownConfigLoaderModule ??= await import(
     '../utils/markdownConfigLoader.js'
   )
   installFileSuggestionsDependencyMocks(options)
   const nonce = `${Date.now()}-${Math.random()}`
   const module = await import(`./fileSuggestions.ts?ts=${nonce}`)
-  restoreDependencyMocks()
+  restoreFileSuggestionsDependencyMocks()
   return module
 }
 

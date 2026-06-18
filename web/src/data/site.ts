@@ -9,7 +9,7 @@ export const SITE = {
   github: 'https://github.com/AndersonBY/openclaude',
   gitlawb: 'https://gitlawb.com',
   gitlawbRepo: 'https://gitlawb.com/node/repos/z6MkqDnb/openclaude',
-  version: '0.18.0',
+  version: '0.19.0',
   ogDefault: '/og/default.png',
   ogDocs: '/og/docs.png',
 } as const

@@ -18,6 +18,8 @@ const originalEnv = {
   OPENAI_AUTH_SCHEME: process.env.OPENAI_AUTH_SCHEME,
   OPENAI_AUTH_HEADER_VALUE: process.env.OPENAI_AUTH_HEADER_VALUE,
   CLAUDE_CODE_USE_GITHUB: process.env.CLAUDE_CODE_USE_GITHUB,
+  GITHUB_COPILOT_KEY: process.env.GITHUB_COPILOT_KEY,
+  GITHUB_ENTERPRISE_URL: process.env.GITHUB_ENTERPRISE_URL,
   GITHUB_TOKEN: process.env.GITHUB_TOKEN,
   GH_TOKEN: process.env.GH_TOKEN,
   CLAUDE_CODE_USE_OPENAI: process.env.CLAUDE_CODE_USE_OPENAI,
@@ -154,6 +156,8 @@ beforeEach(async () => {
   delete process.env.OPENAI_AUTH_SCHEME
   delete process.env.OPENAI_AUTH_HEADER_VALUE
   delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.GITHUB_COPILOT_KEY
+  delete process.env.GITHUB_ENTERPRISE_URL
   delete process.env.GITHUB_TOKEN
   delete process.env.GH_TOKEN
   delete process.env.CLAUDE_CODE_USE_OPENAI
@@ -192,6 +196,8 @@ afterEach(() => {
     restoreEnv('OPENAI_AUTH_SCHEME', originalEnv.OPENAI_AUTH_SCHEME)
     restoreEnv('OPENAI_AUTH_HEADER_VALUE', originalEnv.OPENAI_AUTH_HEADER_VALUE)
     restoreEnv('CLAUDE_CODE_USE_GITHUB', originalEnv.CLAUDE_CODE_USE_GITHUB)
+    restoreEnv('GITHUB_COPILOT_KEY', originalEnv.GITHUB_COPILOT_KEY)
+    restoreEnv('GITHUB_ENTERPRISE_URL', originalEnv.GITHUB_ENTERPRISE_URL)
     restoreEnv('GITHUB_TOKEN', originalEnv.GITHUB_TOKEN)
     restoreEnv('GH_TOKEN', originalEnv.GH_TOKEN)
     restoreEnv('CLAUDE_CODE_USE_OPENAI', originalEnv.CLAUDE_CODE_USE_OPENAI)
@@ -963,6 +969,8 @@ test('strips Anthropic-specific headers on GitHub Codex transport requests', asy
 
   process.env.CLAUDE_CODE_USE_GITHUB = '1'
   process.env.OPENAI_API_KEY = 'github-test-key'
+  process.env.GITHUB_TOKEN = 'stored-secret'
+  delete process.env.GITHUB_COPILOT_KEY
   delete process.env.OPENAI_BASE_URL
   delete process.env.OPENAI_MODEL
 
@@ -1003,6 +1011,35 @@ test('strips Anthropic-specific headers on GitHub Codex transport requests', asy
   expect(capturedHeaders?.get('x-safe-header')).toBe('keep-me')
   expect(capturedHeaders?.get('authorization')).toBe('Bearer github-test-key')
   expect(capturedHeaders?.get('editor-plugin-version')).toBe('copilot-chat/0.26.7')
+})
+
+test('uses direct GitHub Copilot Enterprise key for shim authentication', async () => {
+  process.env.CLAUDE_CODE_USE_GITHUB = '1'
+  process.env.GITHUB_COPILOT_KEY = 'enterprise-direct-key'
+  process.env.GITHUB_ENTERPRISE_URL = 'https://github.mycompany.com'
+  delete process.env.OPENAI_API_KEY
+  delete process.env.OPENAI_BASE_URL
+
+  const { authorization, url } = await captureChatCompletionRequest(
+    'github:gpt-4o',
+  )
+
+  expect(authorization).toBe('Bearer enterprise-direct-key')
+  expect(url).toBe('https://github.mycompany.com/api/copilot/chat/completions')
+})
+
+test('direct GitHub Copilot key wins over stale OpenAI key', async () => {
+  process.env.CLAUDE_CODE_USE_GITHUB = '1'
+  process.env.GITHUB_COPILOT_KEY = 'enterprise-direct-key'
+  process.env.GITHUB_ENTERPRISE_URL = 'https://github.mycompany.com'
+  process.env.OPENAI_API_KEY = 'stale-openai-key'
+  delete process.env.OPENAI_BASE_URL
+
+  const { authorization } = await captureChatCompletionRequest(
+    'github:gpt-4o',
+  )
+
+  expect(authorization).toBe('Bearer enterprise-direct-key')
 })
 
 test('strips Anthropic-specific headers on GitHub Codex transport with providerOverride API key', async () => {
@@ -1950,7 +1987,11 @@ test('preserves image tool results as placeholders in follow-up requests', async
     text?: string
     image_url?: { url: string }
   }>
+  // Issue #1421: image-only tool results now get a placeholder text part
+  // prepended so OpenAI-compatible providers that require a `text` field on
+  // `role: "tool"` messages (e.g. Xiaomi Mimo) don't 400 with "text is not set".
   expect(parts).toEqual([
+    { type: 'text', text: 'Image attached.' },
     {
       type: 'image_url',
       image_url: { url: 'data:image/png;base64,ZmFrZQ==' },
@@ -5275,6 +5316,43 @@ test('drops empty assistant message when only thinking block was present and str
 
   const messages = requestBody?.messages as Array<Record<string, unknown>>
   // The assistant msg is dropped because thinking is stripped.
+  // The two user messages are coalesced.
+  expect(messages.length).toBe(1)
+  expect(messages[0].role).toBe('user')
+  expect(String(messages[0].content)).toContain('Initial')
+  expect(String(messages[0].content)).toContain('Interrupting query')
+})
+
+test('drops empty assistant message when only redacted_thinking block was present and stripped', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(JSON.stringify({
+      id: 'chatcmpl-1',
+      object: 'chat.completion',
+      created: 123456789,
+      model: 'mistral-large-latest',
+      choices: [{ message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await client.beta.messages.create({
+    model: 'mistral-large-latest',
+    messages: [
+      { role: 'user', content: 'Initial' },
+      { role: 'assistant', content: [{ type: 'redacted_thinking', data: '[thinking hidden]' }] },
+      { role: 'user', content: 'Interrupting query' },
+    ],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  // The assistant msg is dropped because redacted_thinking is stripped.
   // The two user messages are coalesced.
   expect(messages.length).toBe(1)
   expect(messages[0].role).toBe('user')

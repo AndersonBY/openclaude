@@ -224,6 +224,11 @@ export type ProviderProfile = {
   authScheme?: OpenAICompatibleAuthScheme
   authHeaderValue?: string
   customHeaders?: Record<string, string>
+  /**
+   * Optional manual override for the provider/model context window in tokens.
+   * Applied to OpenAI-compatible providers when resolving runtime limits.
+   */
+  maxContextLength?: number
 }
 
 export type GlobalConfig = {
@@ -278,6 +283,7 @@ export type GlobalConfig = {
   bypassPermissionsModeAccepted?: boolean
   hasUsedBackslashReturn?: boolean
   autoCompactEnabled: boolean // Controls whether auto-compact is enabled
+  contextCollapseEnabled: boolean // Opt-in: collapse old transcript spans into summaries (lossy; off by default)
   toolHistoryCompressionEnabled: boolean // Compress old tool_result content for small-context providers
   showTurnDuration: boolean // Controls whether to show turn duration message (e.g., "Cooked for 1m 6s")
   // Controls whether to show per-query cache hit/miss stats at the end of each turn.
@@ -670,6 +676,10 @@ export type GlobalConfig = {
   // When enabled, triggers forced compaction if the message count exceeds the
   // chosen threshold, regardless of token usage.
   maxMessagesCompactionThreshold?: MaxMessagesCompactionThreshold
+
+  // Use a different (e.g. cheaper/faster) model for compaction.
+  // Defaults to mainLoopModel when unset.
+  compactModel?: string
 }
 
 /**
@@ -687,6 +697,7 @@ function createDefaultGlobalConfig(): GlobalConfig {
     verbose: false,
     editorMode: 'normal',
     autoCompactEnabled: true,
+    contextCollapseEnabled: false,
     toolHistoryCompressionEnabled: true,
     showTurnDuration: true,
     showCacheStats: 'compact',
@@ -739,6 +750,7 @@ export const GLOBAL_CONFIG_KEYS = [
   'editorMode',
   'hasUsedBackslashReturn',
   'autoCompactEnabled',
+  'contextCollapseEnabled',
   'toolHistoryCompressionEnabled',
   'showTurnDuration',
   'showCacheStats',
@@ -774,6 +786,7 @@ export const GLOBAL_CONFIG_KEYS = [
   'knowledgeGraphEnabled',
   'logoColor',
   'maxMessagesCompactionThreshold',
+  'compactModel',
 ] as const
 
 export type GlobalConfigKey = (typeof GLOBAL_CONFIG_KEYS)[number]
