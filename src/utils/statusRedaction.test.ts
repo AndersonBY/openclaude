@@ -96,6 +96,8 @@ describe('redactUrlForStatus', () => {
 describe('redactPathForStatus', () => {
   beforeEach(async () => {
     await acquireSharedMutationLock('utils/statusRedaction.test.ts')
+    process.env.HOME = REAL_HOMEDIR
+    restoreEnvValue('USERPROFILE', ORIGINAL_USERPROFILE)
   })
 
   afterEach(() => {
@@ -110,17 +112,15 @@ describe('redactPathForStatus', () => {
   })
 
   test('shortens POSIX home directory paths to ~', () => {
-    const home = '/home/openclaude-redaction-test'
-    process.env.HOME = home
-    const result = redactPathForStatus(`${home}/secrets/client.key`)
+    process.env.HOME = REAL_HOMEDIR
+    const result = redactPathForStatus(`${REAL_HOMEDIR}/secrets/client.key`)
     expect(result).toBe('~/secrets/client.key')
-    expect(result).not.toContain(home)
+    expect(result).not.toContain(REAL_HOMEDIR)
   })
 
   test('handles the home directory exactly', () => {
-    const home = '/home/openclaude-redaction-test'
-    process.env.HOME = home
-    expect(redactPathForStatus(home)).toBe('~')
+    process.env.HOME = REAL_HOMEDIR
+    expect(redactPathForStatus(REAL_HOMEDIR)).toBe('~')
   })
 
   test('redacts via USERPROFILE when HOME does not match (Windows-style)', () => {

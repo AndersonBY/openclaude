@@ -32,6 +32,7 @@ const RESTORED_KEYS = [
   'OPENAI_AUTH_HEADER',
   'OPENAI_AUTH_SCHEME',
   'OPENAI_AUTH_HEADER_VALUE',
+  'OPENAI_API_KEYS',
   'OPENAI_API_KEY',
   'GITHUB_COPILOT_KEY',
   'GITHUB_ENTERPRISE_URL',
@@ -219,6 +220,17 @@ function buildXiaomiMimoProfile(overrides: Partial<ProviderProfile> = {}): Provi
     baseUrl: 'https://api.xiaomimimo.com/v1',
     model: 'mimo-v2.5-pro',
     apiKey: 'mimo-test-key',
+    ...overrides,
+  })
+}
+
+function buildXiaomiMimoTokenProfile(overrides: Partial<ProviderProfile> = {}): ProviderProfile {
+  return buildProfile({
+    provider: 'xiaomi-mimo-token',
+    name: 'Xiaomi MiMo Token Plan',
+    baseUrl: 'https://token-plan-sgp.xiaomimimo.com/v1',
+    model: 'mimo-v2.5-pro',
+    apiKey: 'tp-test-key',
     ...overrides,
   })
 }
@@ -749,6 +761,48 @@ describe('applyProviderProfileToProcessEnv', () => {
 
     expect(process.env.OPENAI_BASE_URL).toBe('https://api.xiaomimimo.com/v1')
     expect(process.env.MIMO_API_KEY).toBe('mimo-test-key')
+    expect(getFreshAPIProvider()).toBe('xiaomi-mimo')
+  })
+
+  test('xiaomi mimo token plan profile applies OpenAI-compatible env with MIMO_API_KEY mirror', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CLAUDE_CODE_USE_GEMINI = '1'
+
+    applyProviderProfileToProcessEnv(buildXiaomiMimoTokenProfile())
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.CLAUDE_CODE_USE_GEMINI).toBeUndefined()
+    expect(String(process.env.CLAUDE_CODE_USE_OPENAI)).toBe('1')
+    expect(process.env.OPENAI_BASE_URL).toBe(
+      'https://token-plan-sgp.xiaomimimo.com/v1',
+    )
+    expect(process.env.OPENAI_MODEL).toBe('mimo-v2.5-pro')
+    expect(process.env.OPENAI_API_KEY).toBe('tp-test-key')
+    expect(process.env.MIMO_API_KEY).toBe('tp-test-key')
+    expect(getFreshAPIProvider()).toBe('xiaomi-mimo')
+  })
+
+  test('xiaomi mimo token plan CN profile applies OpenAI-compatible env with MIMO_API_KEY mirror', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CLAUDE_CODE_USE_GEMINI = '1'
+
+    applyProviderProfileToProcessEnv(buildXiaomiMimoTokenProfile({
+      baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+    }))
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.CLAUDE_CODE_USE_GEMINI).toBeUndefined()
+    expect(String(process.env.CLAUDE_CODE_USE_OPENAI)).toBe('1')
+    expect(process.env.OPENAI_BASE_URL).toBe(
+      'https://token-plan-cn.xiaomimimo.com/v1',
+    )
+    expect(process.env.OPENAI_MODEL).toBe('mimo-v2.5-pro')
+    expect(process.env.OPENAI_API_KEY).toBe('tp-test-key')
+    expect(process.env.MIMO_API_KEY).toBe('tp-test-key')
     expect(getFreshAPIProvider()).toBe('xiaomi-mimo')
   })
 
@@ -1556,6 +1610,34 @@ describe('persistActiveProviderProfileModel', () => {
 })
 
 describe('getProviderPresetDefaults', () => {
+  test('openai preset skips delimiter-only pooled keys before singular fallback', async () => {
+    const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
+    process.env.OPENAI_API_KEYS = ', ,'
+    process.env.OPENAI_API_KEY = 'openai-single-key'
+
+    const defaults = getProviderPresetDefaults('openai')
+
+    expect(defaults.apiKey).toBe('openai-single-key')
+  })
+
+  test('openai preset skips placeholder pooled keys before singular fallback', async () => {
+    const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
+    process.env.OPENAI_API_KEYS = 'key-a,SUA_CHAVE'
+    process.env.OPENAI_API_KEY = 'openai-single-key'
+
+    const defaults = getProviderPresetDefaults('openai')
+
+    expect(defaults.apiKey).toBe('openai-single-key')
+  })
+  test('custom preset reads pooled OpenAI credentials', async () => {
+    const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
+    process.env.OPENAI_API_KEYS = 'key-a,key-b'
+    delete process.env.OPENAI_API_KEY
+
+    const defaults = getProviderPresetDefaults('custom')
+
+    expect(defaults.apiKey).toBe('key-a,key-b')
+  })
   test('ollama preset defaults to a local Ollama model', async () => {
     const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
     delete process.env.OPENAI_MODEL
@@ -1665,6 +1747,22 @@ describe('getProviderPresetDefaults', () => {
     expect(defaults.requiresApiKey).toBe(true)
   })
 
+  test('xiaomi mimo token plan preset defaults to the token-plan SGP endpoint', async () => {
+    const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
+    process.env.MIMO_API_KEY = 'tp-live-key'
+
+    const defaults = getProviderPresetDefaults('xiaomi-mimo-token')
+
+    expect(defaults.provider).toBe('xiaomi-mimo-token')
+    expect(defaults.name).toBe('Xiaomi MiMo (Token Plan)')
+    expect(defaults.baseUrl).toBe(
+      'https://token-plan-sgp.xiaomimimo.com/v1',
+    )
+    expect(defaults.model).toBe('mimo-v2.5-pro')
+    expect(defaults.apiKey).toBe('tp-live-key')
+    expect(defaults.requiresApiKey).toBe(true)
+  })
+
   test('xai preset ignores stale generic OpenAI model when creating defaults', async () => {
     const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
     process.env.OPENAI_MODEL = 'gpt-5.4'
@@ -1689,7 +1787,7 @@ describe('getProviderPresetDefaults', () => {
     expect(defaults.provider).toBe('zai')
     expect(defaults.name).toBe('Z.AI - GLM Coding Plan')
     expect(defaults.baseUrl).toBe('https://api.z.ai/api/coding/paas/v4')
-    expect(defaults.model).toBe('GLM-5.1')
+    expect(defaults.model).toBe('glm-5.2')
     expect(defaults.requiresApiKey).toBe(true)
   })
 

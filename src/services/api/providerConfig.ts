@@ -118,6 +118,7 @@ const CODEX_ALIAS_MODELS: Record<
 
 type CodexAlias = keyof typeof CODEX_ALIAS_MODELS
 type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh'
+type ThinkingType = 'enabled' | 'disabled'
 
 const OPENAI_CODEX_SHORTCUT_ALIASES = new Set(['codexplan', 'codexspark'])
 
@@ -131,6 +132,9 @@ export type ResolvedProviderRequest = {
   baseUrl: string
   reasoning?: {
     effort: ReasoningEffort
+  }
+  thinking?: {
+    type: ThinkingType
   }
 }
 
@@ -146,6 +150,9 @@ type ModelDescriptor = {
   baseModel: string
   reasoning?: {
     effort: ReasoningEffort
+  }
+  thinking?: {
+    type: ThinkingType
   }
 }
 
@@ -251,6 +258,14 @@ function parseReasoningEffort(value: string | undefined): ReasoningEffort | unde
   return undefined
 }
 
+function parseThinkingType(value: string | undefined): ThinkingType | undefined {
+  if (!value) return undefined
+  const normalized = value.trim().toLowerCase()
+  return normalized === 'enabled' || normalized === 'disabled'
+    ? normalized
+    : undefined
+}
+
 export function parseOpenAICompatibleApiFormat(
   value: string | undefined,
 ): OpenAICompatibleApiFormat | undefined {
@@ -309,11 +324,13 @@ function parseModelDescriptor(model: string): ModelDescriptor {
     (aliasConfig?.reasoningEffort
       ? { effort: aliasConfig.reasoningEffort }
       : undefined)
+  const thinking = parseThinkingType(params.get('thinking') ?? undefined)
 
   return {
     raw: trimmed,
     baseModel: resolvedBaseModel,
     reasoning: typeof reasoning === 'string' ? { effort: reasoning } : reasoning,
+    thinking: thinking ? { type: thinking } : undefined,
   }
 }
 
@@ -818,9 +835,11 @@ export function resolveProviderRequest(options?: {
     ? normalizeGithubModelsApiModel(requestedModel)
     : requestedModel
 
-  // For GHE instances, build the Copilot API base URL from GITHUB_ENTERPRISE_URL
-  const gheCopilotBaseUrl = gheUrl
-    ? buildGithubEnterpriseCopilotBaseUrl(gheUrl)
+  // For GHE instances, build the Copilot API base URL from either
+  // GITHUB_ENTERPRISE_URL or an already-classified GHE OPENAI_BASE_URL.
+  const gheBaseUrl = isGithubGhe ? (gheUrl ?? rawBaseUrl) : undefined
+  const gheCopilotBaseUrl = gheBaseUrl
+    ? buildGithubEnterpriseCopilotBaseUrl(gheBaseUrl)
     : undefined
 
   const requestedApiFormat =
@@ -883,6 +902,7 @@ export function resolveProviderRequest(options?: {
               : DEFAULT_OPENAI_BASE_URL))))
       ).replace(/\/+$/, ''),
     reasoning,
+    thinking: descriptor.thinking,
   }
 }
 
@@ -909,6 +929,7 @@ export function getAdditionalModelOptionsCacheScope(): string | null {
   }
 
   const partition = hashCacheScopePartition({
+    apiKeys: normalizeCacheScopeHeaderValue(process.env.OPENAI_API_KEYS),
     apiKey: normalizeCacheScopeHeaderValue(process.env.OPENAI_API_KEY),
     authHeader: normalizeCacheScopeHeaderValue(process.env.OPENAI_AUTH_HEADER).toLowerCase(),
     authScheme: normalizeCacheScopeHeaderValue(process.env.OPENAI_AUTH_SCHEME).toLowerCase(),

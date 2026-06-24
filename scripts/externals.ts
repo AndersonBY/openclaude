@@ -43,6 +43,7 @@ export const OPTIONAL_RUNTIME_EXTERNALS: string[] = [
   '@aws-sdk/client-bedrock',
   '@aws-sdk/client-bedrock-runtime',
   '@aws-sdk/client-sts',
+  '@aws-sdk/credential-provider-node',
   '@aws-sdk/credential-providers',
   '@azure/identity',
 ]
@@ -59,7 +60,6 @@ export const INTENTIONALLY_BUNDLED: string[] = [
   '@anthropic-ai/bedrock-sdk',
   '@anthropic-ai/foundry-sdk',
   '@anthropic-ai/sandbox-runtime',
-  '@anthropic-ai/vertex-sdk',
   // CLI / TUI utilities
   '@alcalzone/ansi-tokenize',
   '@commander-js/extra-typings',
@@ -115,7 +115,6 @@ export const INTENTIONALLY_BUNDLED: string[] = [
   // Anthropic SDK (external in SDK bundle, bundled in CLI)
   '@anthropic-ai/sdk',
   // Runtime SDK support packages that native compile must be able to bundle.
-  '@aws-sdk/credential-provider-node',
   '@smithy/core',
   '@smithy/node-http-handler',
   // MCP SDK (external in SDK bundle, bundled in CLI)

@@ -70,6 +70,118 @@ describe('resolveModelRuntimeLimits', () => {
       ).toBe(1_000_000)
     })
   })
+  it('uses built-in Z.AI GLM-5.2 runtime limits', () => {
+    const limits = resolveModelRuntimeLimits({
+      model: 'glm-5.2',
+      processEnv: {
+        OPENAI_BASE_URL: 'https://api.z.ai/api/coding/paas/v4',
+      },
+    })
+
+    expect(limits.contextWindow).toBe(1_000_000)
+    expect(limits.maxOutputTokens).toBe(131_072)
+  })
+  it('uses the applied provider profile route before generic custom base URL fallback', () => {
+    const limits = resolveModelRuntimeLimits({
+      model: 'kimi-k2.6',
+      activeProfileProvider: 'opencode',
+      processEnv: {
+        CLAUDE_CODE_USE_OPENAI: '1',
+        CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED: '1',
+        OPENAI_BASE_URL: 'https://proxy.example.test/v1',
+      },
+    })
+
+    expect(limits.contextWindow).toBe(262_144)
+    expect(limits.maxOutputTokens).toBe(65_536)
+  })
+
+  it('preserves composite provider paths before generic last-segment fallbacks', () => {
+    for (const model of [
+      'openrouter/accounts/fireworks/models/deepseek-v4-pro',
+      'openrouter/fireworks/models/deepseek-v4-pro',
+    ]) {
+      expect(
+        resolveModelRuntimeLimits({
+          model,
+          processEnv: {
+            CLAUDE_CODE_USE_OPENAI: '1',
+            OPENAI_BASE_URL: 'https://openrouter.ai/api/v1',
+          },
+        }).maxOutputTokens,
+      ).toBe(32_768)
+    }
+
+    for (const model of [
+      'openrouter/accounts/fireworks/models/llama-v3p1-70b-instruct',
+      'openrouter/fireworks/models/llama-v3p1-70b-instruct',
+    ]) {
+      expect(
+        resolveModelRuntimeLimits({
+          model,
+          processEnv: {
+            CLAUDE_CODE_USE_OPENAI: '1',
+            OPENAI_BASE_URL: 'https://openrouter.ai/api/v1',
+          },
+        }).contextWindow,
+      ).toBe(131_072)
+    }
+  })
+
+
+  it('uses pooled OpenAI fallback credentials when reading discovered runtime limits', async () => {
+    await withTempConfigDir(async () => {
+      const baseUrl = 'http://localhost:4000/v1'
+      await setCachedModels(
+        getDiscoveryCacheKey('custom', {
+          baseUrl,
+          apiKey: 'key-a',
+        }),
+        {
+          models: [
+            {
+              id: 'pooled-litellm-proxy',
+              apiName: 'pooled-litellm-proxy',
+              label: 'pooled-litellm-proxy',
+              contextWindow: 2_000_000,
+            },
+          ],
+        },
+      )
+
+      expect(
+        resolveModelRuntimeLimits({
+          model: 'pooled-litellm-proxy',
+          processEnv: {
+            CLAUDE_CODE_USE_OPENAI: '1',
+            OPENAI_BASE_URL: baseUrl,
+            OPENAI_API_KEYS: 'key-a,key-b',
+          },
+        }).contextWindow,
+      ).toBe(2_000_000)
+    })
+  })
+})
+
+describe('resolveOpenAIShimRuntimeContext - Z.AI GLM-5.2', () => {
+  it.each([
+    'glm-5.2',
+    'glm-5.2?reasoning=high',
+    'glm-5.2?thinking=disabled',
+  ])('uses Z.AI GLM-5.2 shim settings for %s', model => {
+    const result = resolveOpenAIShimRuntimeContext({
+      model,
+      baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+      processEnv: {},
+    })
+
+    expect(result.routeId).toBe('zai')
+    expect(result.catalogEntry?.id).toBe('glm-5.2')
+    expect(result.openaiShimConfig.thinkingRequestFormat).toBe('zai-compatible')
+    expect(result.openaiShimConfig.preserveReasoningContent).toBe(true)
+    expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBe(true)
+    expect(result.openaiShimConfig.enableToolStreaming).toBe(true)
+  })
 })
 
 describe('resolveOpenAIShimRuntimeContext - segment-boundary heuristic', () => {
@@ -167,5 +279,28 @@ describe('resolveOpenAIShimRuntimeContext - segment-boundary heuristic', () => {
       })
       expect(result.openaiShimConfig.preserveReasoningContent).toBeUndefined()
     })
+  })
+  it('matches provider-prefixed model ids to built-in runtime limits', () => {
+    expect(
+      resolveModelRuntimeLimits({
+        model: 'google/gemini-3.1-pro',
+        activeProfileProvider: 'custom',
+        processEnv: {
+          CLAUDE_CODE_USE_OPENAI: '1',
+          OPENAI_BASE_URL: 'https://example-gateway.test/v1',
+        },
+      }).contextWindow,
+    ).toBe(1_048_576)
+
+    expect(
+      resolveModelRuntimeLimits({
+        model: 'moonshotai/kimi-k2.6',
+        activeProfileProvider: 'nvidia-nim',
+        processEnv: {
+          CLAUDE_CODE_USE_OPENAI: '1',
+          OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+        },
+      }).contextWindow,
+    ).toBe(262_144)
   })
 })
