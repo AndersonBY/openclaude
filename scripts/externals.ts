@@ -115,6 +115,7 @@ export const INTENTIONALLY_BUNDLED: string[] = [
   // Anthropic SDK (external in SDK bundle, bundled in CLI)
   '@anthropic-ai/sdk',
   // Runtime SDK support packages that native compile must be able to bundle.
+  '@aws-sdk/credential-provider-node',
   '@smithy/core',
   '@smithy/node-http-handler',
   // MCP SDK (external in SDK bundle, bundled in CLI)

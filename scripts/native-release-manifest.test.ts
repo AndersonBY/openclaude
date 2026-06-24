@@ -94,4 +94,21 @@ describe('native release workflow', () => {
       expect(workflow).not.toContain(`--external=${dependency}`)
     }
   })
+
+  test('declares bundled runtime SDK dependencies for clean native builds', async () => {
+    const pkg = JSON.parse(
+      await readFile(join(import.meta.dir, '..', 'package.json'), 'utf-8'),
+    )
+    const dependencies = pkg.dependencies ?? {}
+
+    for (const dependency of [
+      '@aws-sdk/client-bedrock',
+      '@aws-sdk/client-bedrock-runtime',
+      '@aws-sdk/client-sts',
+      '@aws-sdk/credential-provider-node',
+      '@aws-sdk/credential-providers',
+    ]) {
+      expect(dependencies).toHaveProperty(dependency)
+    }
+  })
 })
