@@ -55,6 +55,14 @@ function matchesCatalogEntryModel(
     return true
   }
 
+  if (
+    (entry.aliases ?? []).some(
+      alias => normalizeModelApiName(alias) === modelApiName,
+    )
+  ) {
+    return true
+  }
+
   if (!entry.modelDescriptorId) {
     return false
   }
@@ -220,6 +228,7 @@ export function resolveOpenAIShimRuntimeContext(options?: {
   model?: string
   activeProfileProvider?: string
   treatAsLocal?: boolean
+  preferBaseUrlRoute?: boolean
 }): OpenAIShimRuntimeContext {
   const processEnv = options?.processEnv ?? process.env
   const runtimeEnv: NodeJS.ProcessEnv = {
@@ -239,10 +248,12 @@ export function resolveOpenAIShimRuntimeContext(options?: {
   })
   const baseUrlRouteId = resolveRouteIdFromBaseUrl(options?.baseUrl)
   const routeId =
-    baseUrlRouteId &&
-    (!activeRouteId || activeRouteId === 'anthropic' || activeRouteId === 'openai')
+    options?.preferBaseUrlRoute && options.baseUrl !== undefined
       ? baseUrlRouteId
-      : activeRouteId
+      : baseUrlRouteId &&
+        (!activeRouteId || activeRouteId === 'anthropic' || activeRouteId === 'openai')
+        ? baseUrlRouteId
+        : activeRouteId
   const descriptor =
     routeId && routeId !== 'anthropic'
       ? getRouteDescriptor(routeId)

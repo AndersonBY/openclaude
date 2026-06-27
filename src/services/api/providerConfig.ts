@@ -19,6 +19,7 @@ import {
   DEFAULT_GEMINI_BASE_URL,
   DEFAULT_GEMINI_MODEL,
 } from 'src/utils/providerProfile.js'
+import { getCatalogEntriesForRoute } from '../../integrations/registry.js'
 import {
   openAIShimSupportsApiFormatForModel,
   resolveOpenAIShimRuntimeContext,
@@ -247,6 +248,39 @@ function readNestedString(
     if (stringValue) return stringValue
   }
   return undefined
+}
+
+function normalizeModelLookupKey(model: string): string {
+  return model.trim().split('?', 1)[0]?.trim().toLowerCase() ?? ''
+}
+
+function resolveRouteCatalogAliasApiName(options: {
+  model: string
+  baseUrl: string | undefined
+  processEnv: NodeJS.ProcessEnv
+}): string {
+  const normalizedModel = normalizeModelLookupKey(options.model)
+  if (!normalizedModel) return options.model
+
+  const runtimeShimContext = resolveOpenAIShimRuntimeContext({
+    processEnv: options.processEnv,
+    baseUrl: options.baseUrl,
+    model: options.model,
+    treatAsLocal: options.baseUrl ? isLocalProviderUrl(options.baseUrl) : false,
+  })
+  const routeId = runtimeShimContext.routeId
+  if (!routeId || routeId === 'anthropic' || routeId === 'openai') {
+    return options.model
+  }
+
+  const entry = getCatalogEntriesForRoute(routeId).find(catalogEntry =>
+    normalizeModelLookupKey(catalogEntry.apiName) === normalizedModel ||
+    normalizeModelLookupKey(catalogEntry.id) === normalizedModel ||
+    (catalogEntry.aliases ?? []).some(
+      alias => normalizeModelLookupKey(alias) === normalizedModel,
+    ),
+  )
+  return entry?.apiName ?? options.model
 }
 
 function parseReasoningEffort(value: string | undefined): ReasoningEffort | undefined {
@@ -835,42 +869,6 @@ export function resolveProviderRequest(options?: {
     ? normalizeGithubModelsApiModel(requestedModel)
     : requestedModel
 
-  // For GHE instances, build the Copilot API base URL from either
-  // GITHUB_ENTERPRISE_URL or an already-classified GHE OPENAI_BASE_URL.
-  const gheBaseUrl = isGithubGhe ? (gheUrl ?? rawBaseUrl) : undefined
-  const gheCopilotBaseUrl = gheBaseUrl
-    ? buildGithubEnterpriseCopilotBaseUrl(gheBaseUrl)
-    : undefined
-
-  const requestedApiFormat =
-    isGithubMode
-      ? undefined
-      : parseOpenAICompatibleApiFormat(options?.apiFormat) ??
-        parseOpenAICompatibleApiFormat(processEnv.OPENAI_API_FORMAT)
-  const supportsRequestedApiFormat =
-    (requestedApiFormat !== 'responses' && requestedApiFormat !== 'responses_compat') ||
-    (() => {
-      const runtimeShimContext = resolveOpenAIShimRuntimeContext({
-        processEnv,
-        baseUrl: finalBaseUrl,
-        model: descriptor.baseModel,
-        treatAsLocal: finalBaseUrl ? isLocalProviderUrl(finalBaseUrl) : false,
-      })
-
-      return openAIShimSupportsApiFormatForModel(
-        runtimeShimContext.openaiShimConfig,
-        'responses',
-        descriptor.baseModel,
-      )
-    })()
-  const transport: ProviderTransport =
-    shouldUseCodexTransport(requestedModel, finalBaseUrl) ||
-      (isGithubCopilotLike && shouldUseGithubResponsesApi(githubResolvedModel))
-      ? 'codex_responses'
-      : (requestedApiFormat === 'responses' || requestedApiFormat === 'responses_compat') && supportsRequestedApiFormat
-        ? requestedApiFormat
-        : 'chat_completions'
-
   // For GitHub Copilot API, normalize to real model ID (e.g., "github:copilot" -> "gpt-4o")
   // For GitHub Models/custom endpoints:
   //   - Normalize default alias (github:copilot -> gpt-4o)
@@ -879,7 +877,57 @@ export function resolveProviderRequest(options?: {
     ? normalizeGithubCopilotModel(descriptor.baseModel)
     : (isGithubModels || isGithubCustom || isGithubGhe
       ? normalizeGithubModelsApiModel(descriptor.baseModel)
-      : descriptor.baseModel)
+      : resolveRouteCatalogAliasApiName({
+          model: descriptor.baseModel,
+          baseUrl: finalBaseUrl,
+          processEnv,
+        }))
+
+  // For GHE instances, build the Copilot API base URL from either
+  // GITHUB_ENTERPRISE_URL or an already-classified GHE OPENAI_BASE_URL.
+  const gheBaseUrl = isGithubGhe ? (gheUrl ?? rawBaseUrl) : undefined
+  const gheCopilotBaseUrl = gheBaseUrl
+    ? buildGithubEnterpriseCopilotBaseUrl(gheBaseUrl)
+    : undefined
+
+  const runtimeShimContext =
+    isGithubMode
+      ? null
+      : resolveOpenAIShimRuntimeContext({
+          processEnv,
+          baseUrl: finalBaseUrl,
+          model: resolvedModel,
+          treatAsLocal: finalBaseUrl ? isLocalProviderUrl(finalBaseUrl) : false,
+        })
+  const explicitApiFormat =
+    isGithubMode
+      ? undefined
+      : parseOpenAICompatibleApiFormat(options?.apiFormat) ??
+        parseOpenAICompatibleApiFormat(processEnv.OPENAI_API_FORMAT)
+  const requiredApiFormat =
+    isGithubMode
+      ? undefined
+      : parseOpenAICompatibleApiFormat(runtimeShimContext?.openaiShimConfig.requiredApiFormat)
+  const requestedApiFormat =
+    requiredApiFormat &&
+    (explicitApiFormat === undefined || explicitApiFormat === 'chat_completions')
+      ? requiredApiFormat
+      : explicitApiFormat ??
+        parseOpenAICompatibleApiFormat(runtimeShimContext?.openaiShimConfig.defaultApiFormat)
+  const supportsRequestedApiFormat =
+    (requestedApiFormat !== 'responses' && requestedApiFormat !== 'responses_compat') ||
+    openAIShimSupportsApiFormatForModel(
+      runtimeShimContext?.openaiShimConfig,
+      'responses',
+      resolvedModel,
+    )
+  const transport: ProviderTransport =
+    shouldUseCodexTransport(requestedModel, finalBaseUrl) ||
+      (isGithubCopilotLike && shouldUseGithubResponsesApi(githubResolvedModel))
+      ? 'codex_responses'
+      : (requestedApiFormat === 'responses' || requestedApiFormat === 'responses_compat') && supportsRequestedApiFormat
+        ? requestedApiFormat
+        : 'chat_completions'
 
   const reasoning = options?.reasoningEffortOverride
     ? { effort: options.reasoningEffortOverride }

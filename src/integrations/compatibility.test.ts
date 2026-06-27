@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import './index.js'
 import {
   getGateway,
+  getModelsForGateway,
   getVendor,
 } from './index.js'
 import {
@@ -76,6 +77,28 @@ describe('compatibility mappings', () => {
     }
   })
 
+  test('Atlas Cloud is modeled as a gateway while preserving the atlas-cloud preset', () => {
+    expect(getVendor('atlas-cloud')).toBeUndefined()
+    expect(getGateway('atlas-cloud')?.id).toBe('atlas-cloud')
+    expect(routeForPreset('atlas-cloud')).toEqual({
+      vendorId: 'openai',
+      gatewayId: 'atlas-cloud',
+      routeId: 'atlas-cloud',
+    })
+    expect(resolveProfileRoute('atlas-cloud')).toEqual({
+      vendorId: 'openai',
+      gatewayId: 'atlas-cloud',
+      routeId: 'atlas-cloud',
+    })
+  })
+
+  test('Atlas Cloud gateway models do not resolve to NearAI-scoped descriptors', () => {
+    const atlasModels = getModelsForGateway('atlas-cloud')
+    expect(atlasModels.length).toBeGreaterThan(0)
+    expect(
+      atlasModels.filter(model => model.vendorId === 'nearai'),
+    ).toEqual([])
+  })
   test('native gateway profile routes use their descriptor vendor', () => {
     expect(resolveProfileRoute('bedrock')).toEqual({
       vendorId: 'anthropic',

@@ -817,8 +817,14 @@ function formatFileLines(file: { content: string; startLine: number }): string {
 export const CYBER_RISK_MITIGATION_REMINDER = ''
 
 
-// Models where cyber risk mitigation should be skipped
-const MITIGATION_EXEMPT_MODELS = new Set(['claude-opus-4-6'])
+// Models where cyber risk mitigation should be skipped. The recent Opus models
+// (4.8/4.7) inherit 4.6's exemption — 4.8 is now the first-party default, so
+// without this it would get the reminder on every file read that 4.6 did not.
+const MITIGATION_EXEMPT_MODELS = new Set([
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-opus-4-6',
+])
 
 function shouldIncludeFileReadMitigation(): boolean {
   // [Red Team Edition] Always disabled
