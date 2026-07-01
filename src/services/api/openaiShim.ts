@@ -77,6 +77,7 @@ import {
   getLocalFastPathConfig,
   getLocalProviderRetryBaseUrls,
   getGithubEndpointType,
+  isDirectLocalOllamaEndpoint,
   isLikelyOllamaEndpoint,
   isLocalProviderUrl,
   resolveRuntimeCodexCredentials,
@@ -92,6 +93,7 @@ import {
 import { sanitizeSchemaForOpenAICompat } from '../../utils/schemaSanitizer.js'
 import { redactSecretValueForDisplay, type SecretValueSource } from '../../utils/providerProfile.js'
 import { shouldRedactUrlQueryParam } from '../../utils/urlRedaction.js'
+import { createCombinedAbortSignal } from '../../utils/combinedAbortSignal.js'
 import {
   normalizeToolArguments,
   hasToolFieldMapping,
@@ -109,11 +111,14 @@ import {
   hasInvalidCredentialPlaceholder,
   parseCredentialList,
 } from './credentialPool.js'
+import { MIN_RECOMMENDED_OLLAMA_CONTEXT_TOKENS } from '../../utils/ollamaContext.js'
 
 const GITHUB_429_MAX_RETRIES = 3
 const GITHUB_429_BASE_DELAY_SEC = 1
 const GITHUB_429_MAX_DELAY_SEC = 32
 const CREDENTIAL_POOL_COOLDOWN_MS = 30_000
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 90_000
+const MAX_STREAM_IDLE_TIMEOUT_MS = 2_147_483_647
 const GEMINI_API_HOST = 'generativelanguage.googleapis.com'
 const COPILOT_HEADERS: Record<string, string> = {
   'User-Agent': 'GitHubCopilotChat/0.26.7',
@@ -125,6 +130,125 @@ const COPILOT_HEADERS: Record<string, string> = {
 function isCopilotTokenExpiredError(text: string): boolean {
   const lower = text.toLowerCase()
   return lower.includes('token expired') || lower.includes('token has expired')
+}
+
+class StreamIdleTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Stream idle timeout - no chunks received for ${timeoutMs}ms`)
+    this.name = 'StreamIdleTimeoutError'
+  }
+}
+
+function createStreamAbortError(): DOMException {
+  return new DOMException('Aborted', 'AbortError')
+}
+
+function throwIfStreamAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createStreamAbortError()
+  }
+}
+
+type StreamReadResult = Awaited<
+  ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>
+>
+
+function createReaderCanceller(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+): {
+    cancel: (error?: unknown) => void
+    cleanup: () => void
+  } {
+  let cancelled = false
+  const cancel = (error: unknown = createStreamAbortError()) => {
+    if (cancelled) return
+    cancelled = true
+    void reader.cancel(error).catch(() => {})
+  }
+  const onAbort = () => cancel(createStreamAbortError())
+
+  signal?.addEventListener('abort', onAbort, { once: true })
+  if (signal?.aborted) {
+    onAbort()
+  }
+
+  return {
+    cancel,
+    cleanup: () => signal?.removeEventListener('abort', onAbort),
+  }
+}
+
+export function getStreamIdleTimeoutMs(): number {
+  const raw = process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS?.trim()
+  if (!raw || !/^\d+$/.test(raw)) return DEFAULT_STREAM_IDLE_TIMEOUT_MS
+  const parsed = Number(raw)
+  return Number.isSafeInteger(parsed) && parsed > 0
+    ? Math.min(parsed, MAX_STREAM_IDLE_TIMEOUT_MS)
+    : DEFAULT_STREAM_IDLE_TIMEOUT_MS
+}
+
+async function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  options: {
+    signal?: AbortSignal
+    cancelReader?: (error?: unknown) => void
+    onTimeout?: () => void
+  } = {},
+): Promise<StreamReadResult> {
+  const signal = options.signal
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+
+  return new Promise<StreamReadResult>((resolve, reject) => {
+    let settled = false
+    const cleanup = () => {
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId)
+        timeoutId = undefined
+      }
+      signal?.removeEventListener('abort', onAbort)
+    }
+    const finishResolve = (value: StreamReadResult) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(value)
+    }
+    const finishReject = (error: unknown) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(error)
+    }
+    const cancelAndReject = (error: unknown) => {
+      if (options.cancelReader) {
+        options.cancelReader(error)
+      } else {
+        void reader.cancel(error).catch(() => {})
+      }
+      finishReject(error)
+    }
+    const onAbort = () => cancelAndReject(createStreamAbortError())
+
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+
+    timeoutId = setTimeout(() => {
+      const error = new StreamIdleTimeoutError(timeoutMs)
+      try {
+        options.onTimeout?.()
+      } catch {
+        // ignore diagnostic callback failures
+      }
+      cancelAndReject(error)
+    }, timeoutMs)
+
+    reader.read().then(finishResolve, finishReject)
+  })
 }
 
 function isGithubModelsMode(): boolean {
@@ -298,6 +422,399 @@ interface OpenAITool {
     parameters: Record<string, unknown>
     strict?: boolean
   }
+}
+
+type OllamaChatResponse = {
+  model?: string
+  message?: {
+    role?: string
+    content?: string
+    tool_calls?: Array<{
+      function?: {
+        name?: string
+        arguments?: unknown
+      }
+    }>
+  }
+  done?: boolean
+  done_reason?: string
+  prompt_eval_count?: number
+  eval_count?: number
+}
+
+type OllamaChatMessage = Omit<OpenAIMessage, 'content' | 'tool_calls'> & {
+  content?: string
+  images?: string[]
+  tool_calls?: Array<{
+    function: {
+      name: string
+      arguments: Record<string, unknown>
+    }
+  }>
+}
+
+function parsePositiveIntegerEnv(value: string | undefined): number | null {
+  if (!value?.trim()) {
+    return null
+  }
+  const parsed = Number(value.trim())
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null
+  }
+  return parsed
+}
+
+function getOllamaNumCtx(): number {
+  return (
+    parsePositiveIntegerEnv(process.env.OPENCLAUDE_OLLAMA_NUM_CTX) ??
+    parsePositiveIntegerEnv(process.env.OLLAMA_CONTEXT_LENGTH) ??
+    MIN_RECOMMENDED_OLLAMA_CONTEXT_TOKENS
+  )
+}
+
+function buildOllamaChatUrl(baseUrl: string): string {
+  const parsed = new URL(baseUrl)
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '').replace(/\/v1$/i, '')
+  parsed.pathname = `${parsed.pathname.replace(/\/+$/, '')}/api/chat`
+  parsed.search = ''
+  parsed.hash = ''
+  return parsed.toString()
+}
+
+function extractOllamaImageData(url: string): string | null {
+  const match = url.match(/^data:[^;,]+;base64,(.+)$/i)
+  if (!match) {
+    return null
+  }
+  return match[1]
+}
+
+function normalizeOllamaNativeToolCalls(
+  toolCalls: OpenAIMessage['tool_calls'],
+): OllamaChatMessage['tool_calls'] {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    return undefined
+  }
+
+  const normalized = toolCalls
+    .map(toolCall => {
+      const name = toolCall.function?.name
+      if (!name) {
+        return null
+      }
+
+      let args: Record<string, unknown> = {}
+      try {
+        const parsed = JSON.parse(toolCall.function.arguments || '{}')
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          args = parsed as Record<string, unknown>
+        }
+      } catch {
+        args = {}
+      }
+
+      return {
+        function: {
+          name,
+          arguments: args,
+        },
+      }
+    })
+    .filter((toolCall): toolCall is NonNullable<typeof toolCall> => toolCall !== null)
+
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function normalizeOllamaNativeMessages(messages: unknown): OllamaChatMessage[] {
+  if (!Array.isArray(messages)) {
+    return []
+  }
+
+  return messages.map(message => {
+    const openAIMessage = message as OpenAIMessage
+    const content = openAIMessage.content
+    const toolCalls = normalizeOllamaNativeToolCalls(openAIMessage.tool_calls)
+    if (!Array.isArray(content)) {
+      return {
+        ...openAIMessage,
+        content,
+        ...(toolCalls ? { tool_calls: toolCalls } : { tool_calls: undefined }),
+      }
+    }
+
+    const textParts: string[] = []
+    const images: string[] = []
+
+    for (const part of content) {
+      if (part.type === 'text') {
+        if (part.text) {
+          textParts.push(part.text)
+        }
+        continue
+      }
+
+      if (part.type === 'image_url') {
+        const imageUrl = part.image_url.url
+        const imageData = extractOllamaImageData(imageUrl)
+        if (imageData) {
+          images.push(imageData)
+        } else {
+          textParts.push(`[Image: ${imageUrl}]`)
+        }
+      }
+    }
+
+    return {
+      ...openAIMessage,
+      content: textParts.join('\n'),
+      ...(images.length > 0 ? { images } : {}),
+      ...(toolCalls ? { tool_calls: toolCalls } : { tool_calls: undefined }),
+    }
+  })
+}
+
+function mapOllamaDoneReason(doneReason: unknown): string | null {
+  if (doneReason === 'length') return 'length'
+  if (doneReason === 'stop') return 'stop'
+  if (typeof doneReason === 'string' && doneReason) return doneReason
+  return null
+}
+
+function normalizeOllamaToolCalls(
+  toolCalls: NonNullable<OllamaChatResponse['message']>['tool_calls'],
+): Array<{
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}> | undefined {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    return undefined
+  }
+
+  const normalized = toolCalls
+    .map(toolCall => {
+      const name = toolCall.function?.name
+      if (!name) {
+        return null
+      }
+      const args = toolCall.function?.arguments
+      return {
+        id: `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+        type: 'function' as const,
+        function: {
+          name,
+          arguments:
+            typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+        },
+      }
+    })
+    .filter((toolCall): toolCall is NonNullable<typeof toolCall> => toolCall !== null)
+
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function buildOpenAIUsageFromOllama(data: OllamaChatResponse) {
+  const promptTokens = data.prompt_eval_count ?? 0
+  const completionTokens = data.eval_count ?? 0
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+  }
+}
+
+function convertOllamaChatResponseToOpenAI(
+  data: OllamaChatResponse,
+  fallbackModel: string,
+): Record<string, unknown> {
+  const toolCalls = normalizeOllamaToolCalls(data.message?.tool_calls)
+  return {
+    id: makeMessageId(),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: data.model ?? fallbackModel,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: data.message?.content ?? '',
+          ...(toolCalls ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: mapOllamaDoneReason(data.done_reason),
+      },
+    ],
+    usage: buildOpenAIUsageFromOllama(data),
+  }
+}
+
+function responseWithPreservedUrl(
+  body: BodyInit | null,
+  init: ResponseInit,
+  url: string,
+): Response {
+  const response = new Response(body, init)
+  try {
+    Object.defineProperty(response, 'url', {
+      value: url,
+      configurable: true,
+    })
+  } catch {
+    /* some runtimes lock the property; downstream has transport fallback */
+  }
+  return response
+}
+
+async function convertOllamaNonStreamingResponse(
+  response: Response,
+  fallbackModel: string,
+): Promise<Response> {
+  const data = await response.json() as OllamaChatResponse
+  return responseWithPreservedUrl(
+    JSON.stringify(convertOllamaChatResponseToOpenAI(data, fallbackModel)),
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers: { 'content-type': 'application/json' },
+    },
+    response.url,
+  )
+}
+
+function openAIStreamChunk(
+  id: string,
+  model: string,
+  delta: Record<string, unknown>,
+  finishReason: string | null = null,
+): string {
+  return `data: ${JSON.stringify({
+    id,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })}\n\n`
+}
+
+function convertOllamaStreamingResponse(
+  response: Response,
+  fallbackModel: string,
+): Response {
+  const body = response.body
+  if (!body) {
+    return response
+  }
+
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  const reader = body.getReader()
+  const streamId = makeMessageId()
+  let buffer = ''
+  let hasEmittedRole = false
+  let hasEmittedToolCall = false
+
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) {
+          if (buffer.trim()) {
+            enqueueOllamaLineAsOpenAI(buffer.trim(), controller)
+            buffer = ''
+          }
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+          return
+        }
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split(/\r?\n/)
+        buffer = lines.pop() ?? ''
+
+        let emittedLine = false
+        for (const line of lines) {
+          if (line.trim()) {
+            enqueueOllamaLineAsOpenAI(line.trim(), controller)
+            emittedLine = true
+          }
+        }
+        if (emittedLine) {
+          return
+        }
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason)
+    },
+  })
+
+  function enqueueOllamaLineAsOpenAI(
+    line: string,
+    controller: ReadableStreamDefaultController<Uint8Array>,
+  ): void {
+    let data: OllamaChatResponse
+    try {
+      data = JSON.parse(line) as OllamaChatResponse
+    } catch {
+      return
+    }
+
+    const model = data.model ?? fallbackModel
+    const chunks: string[] = []
+    const delta: Record<string, unknown> = {}
+    if (!hasEmittedRole) {
+      delta.role = 'assistant'
+      hasEmittedRole = true
+    }
+    if (data.message?.content) {
+      delta.content = data.message.content
+    }
+    const toolCalls = normalizeOllamaToolCalls(data.message?.tool_calls)
+    if (toolCalls) {
+      hasEmittedToolCall = true
+      delta.tool_calls = toolCalls.map((toolCall, index) => ({
+        index,
+        id: toolCall.id,
+        type: toolCall.type,
+        function: toolCall.function,
+      }))
+    }
+    if (Object.keys(delta).length > 0) {
+      chunks.push(openAIStreamChunk(streamId, model, delta))
+    }
+    if (data.done) {
+      chunks.push(openAIStreamChunk(
+        streamId,
+        model,
+        {},
+        hasEmittedToolCall
+          ? 'tool_calls'
+          : mapOllamaDoneReason(data.done_reason),
+      ))
+      chunks.push(`data: ${JSON.stringify({
+        id: streamId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [],
+        usage: buildOpenAIUsageFromOllama(data),
+      })}\n\n`)
+    }
+
+    for (const chunk of chunks) {
+      controller.enqueue(encoder.encode(chunk))
+    }
+  }
+
+  return responseWithPreservedUrl(
+    stream,
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers: { 'content-type': 'text/event-stream' },
+    },
+    response.url,
+  )
 }
 
 function convertSystemPrompt(
@@ -1371,33 +1888,39 @@ async function* anthropicSsePassthrough(
   const readerOrNull = response.body?.getReader()
   if (!readerOrNull) throw new Error('Response body is not readable')
   const reader: ReadableStreamDefaultReader<Uint8Array> = readerOrNull
+  const readerCanceller = createReaderCanceller(reader, signal)
   const decoder = new TextDecoder()
   let buffer = ''
-
-  // Read helper that properly cleans up abort listeners (mirrors codexShim.ts pattern).
-  type ReadResult = Awaited<ReturnType<typeof reader.read>>
-  function readWithAbort(): Promise<ReadResult> {
-    if (!signal) return reader.read()
-    return new Promise<ReadResult>((resolve, reject) => {
-      const onAbort = () => reject(new DOMException('Aborted', 'AbortError'))
-      signal.addEventListener('abort', onAbort, { once: true })
-      reader.read().then(
-        result => { signal.removeEventListener('abort', onAbort); resolve(result) },
-        err => { signal.removeEventListener('abort', onAbort); reject(err) },
-      )
-    })
-  }
+  const streamIdleTimeoutMs = getStreamIdleTimeoutMs()
+  let lastDataTime = Date.now()
+  let streamComplete = false
 
   try {
     while (true) {
-      const { done, value } = await readWithAbort()
-      if (done) break
+      const { done, value } = await readWithIdleTimeout(reader, streamIdleTimeoutMs, {
+        signal,
+        cancelReader: readerCanceller.cancel,
+        onTimeout: () => {
+          const elapsed = Math.round((Date.now() - lastDataTime) / 1000)
+          logForDebugging(
+            `Anthropic-compatible SSE stream idle for ${elapsed}s (limit: ${streamIdleTimeoutMs / 1000}s). Connection likely dropped.`,
+            { level: 'error' },
+          )
+        },
+      })
+      if (done) {
+        streamComplete = true
+        break
+      }
+      if (value) lastDataTime = Date.now()
 
+      throwIfStreamAborted(signal)
       buffer += decoder.decode(value, { stream: true })
       const chunks = buffer.split('\n\n')
       buffer = chunks.pop() ?? ''
 
       for (const chunk of chunks) {
+        throwIfStreamAborted(signal)
         const lines = chunk.split('\n').map(l => l.trim()).filter(Boolean)
         if (lines.length === 0) continue
 
@@ -1405,19 +1928,29 @@ async function* anthropicSsePassthrough(
         if (dataLines.length === 0) continue
 
         const rawData = dataLines.map(l => l.slice(6)).join('\n')
-        if (rawData === '[DONE]') return
+        if (rawData === '[DONE]') {
+          streamComplete = true
+          return
+        }
 
+        let parsed: AnthropicStreamEvent
         try {
-          const parsed = JSON.parse(rawData) as AnthropicStreamEvent
-          if (parsed && typeof parsed === 'object' && 'type' in parsed) {
-            yield parsed
-          }
+          parsed = JSON.parse(rawData) as AnthropicStreamEvent
         } catch {
           // skip malformed frames
+          continue
+        }
+        if (parsed && typeof parsed === 'object' && 'type' in parsed) {
+          throwIfStreamAborted(signal)
+          yield parsed
         }
       }
     }
   } finally {
+    if (!streamComplete || signal?.aborted) {
+      readerCanceller.cancel(createStreamAbortError())
+    }
+    readerCanceller.cleanup()
     reader.releaseLock()
   }
 }
@@ -1433,6 +1966,7 @@ async function* geminiSseToAnthropic(
 ): AsyncGenerator<AnthropicStreamEvent> {
   const reader: ReadableStreamDefaultReader<Uint8Array> | undefined = response.body?.getReader()
   if (!reader) throw new Error('Response body is not readable')
+  const readerCanceller = createReaderCanceller(reader, signal)
   const decoder = new TextDecoder()
   let buffer = ''
   const messageId = makeMessageId()
@@ -1442,18 +1976,9 @@ async function* geminiSseToAnthropic(
   let hasEmittedCurrentTool = false
   let usage: Partial<AnthropicUsage> | undefined
   let finishReason: string | undefined
-
-  function readWithAbort(): Promise<ReadableStreamReadResult<Uint8Array>> {
-    if (!signal) return reader!.read() as Promise<ReadableStreamReadResult<Uint8Array>>
-    return new Promise((resolve, reject) => {
-      const onAbort = () => reject(new DOMException('Aborted', 'AbortError'))
-      signal.addEventListener('abort', onAbort, { once: true })
-      reader!.read().then(
-        result => { signal.removeEventListener('abort', onAbort); resolve(result as ReadableStreamReadResult<Uint8Array>) },
-        err => { signal.removeEventListener('abort', onAbort); reject(err) },
-      )
-    })
-  }
+  const streamIdleTimeoutMs = getStreamIdleTimeoutMs()
+  let lastDataTime = Date.now()
+  let streamComplete = false
 
   function mapFinishReason(reason: string | undefined, hasToolUse: boolean): string {
     if (hasToolUse) return 'tool_use'
@@ -1463,14 +1988,30 @@ async function* geminiSseToAnthropic(
 
   try {
     while (true) {
-      const { done, value } = await readWithAbort()
-      if (done) break
+      const { done, value } = await readWithIdleTimeout(reader, streamIdleTimeoutMs, {
+        signal,
+        cancelReader: readerCanceller.cancel,
+        onTimeout: () => {
+          const elapsed = Math.round((Date.now() - lastDataTime) / 1000)
+          logForDebugging(
+            `Gemini SSE stream idle for ${elapsed}s (limit: ${streamIdleTimeoutMs / 1000}s). Connection likely dropped.`,
+            { level: 'error' },
+          )
+        },
+      })
+      if (done) {
+        streamComplete = true
+        break
+      }
+      if (value) lastDataTime = Date.now()
 
+      throwIfStreamAborted(signal)
       buffer += decoder.decode(value, { stream: true })
       const chunks = buffer.split('\n\n')
       buffer = chunks.pop() ?? ''
 
       for (const chunk of chunks) {
+        throwIfStreamAborted(signal)
         const lines = chunk.split('\n').map(l => l.trim()).filter(Boolean)
         const dataLines = lines.filter(l => l.startsWith('data: '))
         if (dataLines.length === 0) continue
@@ -1478,14 +2019,18 @@ async function* geminiSseToAnthropic(
         const rawData = dataLines.map(l => l.slice(6)).join('\n')
         if (rawData === '[DONE]') {
           if (hasEmittedTextStart || hasEmittedCurrentTool) {
+            throwIfStreamAborted(signal)
             yield { type: 'content_block_stop', index: contentBlockIndex }
           }
+          throwIfStreamAborted(signal)
           yield {
             type: 'message_delta',
             delta: { stop_reason: mapFinishReason(finishReason, hasEmittedCurrentTool) },
             usage: usage ?? {},
           }
+          throwIfStreamAborted(signal)
           yield { type: 'message_stop' }
+          streamComplete = true
           return
         }
 
@@ -1497,6 +2042,7 @@ async function* geminiSseToAnthropic(
         }
 
         if (!hasEmittedStart) {
+          throwIfStreamAborted(signal)
           yield {
             type: 'message_start',
             message: {
@@ -1533,16 +2079,19 @@ async function* geminiSseToAnthropic(
         if (!content || !content.parts) continue
 
         for (const part of content.parts) {
+          throwIfStreamAborted(signal)
           const text = part.text as string | undefined
           const fc = part.functionCall as { name?: string; args?: unknown } | undefined
 
           if (text) {
             if (hasEmittedCurrentTool) {
+              throwIfStreamAborted(signal)
               yield { type: 'content_block_stop', index: contentBlockIndex }
               contentBlockIndex++
               hasEmittedCurrentTool = false
             }
             if (!hasEmittedTextStart) {
+              throwIfStreamAborted(signal)
               yield {
                 type: 'content_block_start',
                 index: contentBlockIndex,
@@ -1550,6 +2099,7 @@ async function* geminiSseToAnthropic(
               }
               hasEmittedTextStart = true
             }
+            throwIfStreamAborted(signal)
             yield {
               type: 'content_block_delta',
               index: contentBlockIndex,
@@ -1557,11 +2107,13 @@ async function* geminiSseToAnthropic(
             }
           } else if (fc?.name) {
             if (hasEmittedTextStart) {
+              throwIfStreamAborted(signal)
               yield { type: 'content_block_stop', index: contentBlockIndex }
               contentBlockIndex++
               hasEmittedTextStart = false
             }
             const toolId = `toolu_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`
+            throwIfStreamAborted(signal)
             yield {
               type: 'content_block_start',
               index: contentBlockIndex,
@@ -1573,6 +2125,7 @@ async function* geminiSseToAnthropic(
               },
             }
             hasEmittedCurrentTool = true
+            throwIfStreamAborted(signal)
             yield {
               type: 'content_block_delta',
               index: contentBlockIndex,
@@ -1587,15 +2140,23 @@ async function* geminiSseToAnthropic(
     }
 
     if (hasEmittedTextStart || hasEmittedCurrentTool) {
+      throwIfStreamAborted(signal)
       yield { type: 'content_block_stop', index: contentBlockIndex }
     }
+    throwIfStreamAborted(signal)
     yield {
       type: 'message_delta',
       delta: { stop_reason: mapFinishReason(finishReason, hasEmittedCurrentTool) },
       usage: usage ?? {},
     }
+    throwIfStreamAborted(signal)
     yield { type: 'message_stop' }
+    streamComplete = true
   } finally {
+    if (!streamComplete || signal?.aborted) {
+      readerCanceller.cancel(createStreamAbortError())
+    }
+    readerCanceller.cleanup()
     reader.releaseLock()
   }
 }
@@ -1642,84 +2203,23 @@ async function* openaiStreamToAnthropic(
   let xmlToolCallText: string | null = null
   let xmlHoldback = ''
 
-  // Emit message_start
-  yield {
-    type: 'message_start',
-    message: {
-      id: messageId,
-      type: 'message',
-      role: 'assistant',
-      content: [],
-      model,
-      stop_reason: null,
-      stop_sequence: null,
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-      },
-    },
-  }
-
   const readerOrNull = response.body?.getReader()
   if (!readerOrNull) throw new Error('Response body is not readable')
   const reader: ReadableStreamDefaultReader<Uint8Array> = readerOrNull
+  const readerCanceller = createReaderCanceller(reader, signal)
 
   const decoder = new TextDecoder()
   let buffer = ''
-  const STREAM_IDLE_TIMEOUT_MS = 120_000 // 2 minutes without data = connection likely dead
+  const streamIdleTimeoutMs = getStreamIdleTimeoutMs()
   let lastDataTime = Date.now()
-
-  /**
-   * Read from the stream with an idle timeout. If no data arrives within
-   * STREAM_IDLE_TIMEOUT_MS, assume the connection is dead and throw so
-   * withRetry can reconnect. This prevents indefinite hangs on stale
-   * SSE connections from OpenAI/Gemini during long-running sessions.
-   * Respects the caller's AbortSignal — clears the idle timer on abort
-   * so the rejection reason is AbortError, not a spurious idle timeout.
-   */
-  type ReadResult = Awaited<ReturnType<typeof reader.read>>
-  async function readWithTimeout(): Promise<ReadResult> {
-    return new Promise<ReadResult>((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        const elapsed = Math.round((Date.now() - lastDataTime) / 1000)
-        reject(new Error(
-          `OpenAI/Gemini SSE stream idle for ${elapsed}s (limit: ${STREAM_IDLE_TIMEOUT_MS / 1000}s). Connection likely dropped.`,
-        ))
-      }, STREAM_IDLE_TIMEOUT_MS)
-
-      // If the caller aborts, clear the timer so the AbortError surfaces
-      // cleanly instead of being masked by a spurious idle timeout.
-      let abortCleanup: (() => void) | undefined
-      if (signal) {
-        abortCleanup = () => {
-          clearTimeout(timeoutId)
-        }
-        signal.addEventListener('abort', abortCleanup, { once: true })
-      }
-
-      reader.read().then(
-        result => {
-          clearTimeout(timeoutId)
-          if (signal && abortCleanup) signal.removeEventListener('abort', abortCleanup)
-          if (result.value) lastDataTime = Date.now()
-          resolve(result)
-        },
-        err => {
-          clearTimeout(timeoutId)
-          if (signal && abortCleanup) signal.removeEventListener('abort', abortCleanup)
-          reject(err)
-        },
-      )
-    })
-  }
+  let streamComplete = false
 
   const closeActiveContentBlock = async function* () {
     if (!hasEmittedContentStart) return
 
     const tail = thinkFilter.flush()
     if (tail) {
+      throwIfStreamAborted(signal)
       yield {
         type: 'content_block_delta',
         index: contentBlockIndex,
@@ -1727,6 +2227,7 @@ async function* openaiStreamToAnthropic(
       }
     }
 
+    throwIfStreamAborted(signal)
     yield {
       type: 'content_block_stop',
       index: contentBlockIndex,
@@ -1738,6 +2239,7 @@ async function* openaiStreamToAnthropic(
   const emitTextDelta = async function* (text: string) {
     if (!text) return
     if (!hasEmittedContentStart) {
+      throwIfStreamAborted(signal)
       yield {
         type: 'content_block_start',
         index: contentBlockIndex,
@@ -1748,6 +2250,7 @@ async function* openaiStreamToAnthropic(
 
     const visible = thinkFilter.feed(text)
     if (visible) {
+      throwIfStreamAborted(signal)
       yield {
         type: 'content_block_delta',
         index: contentBlockIndex,
@@ -1761,6 +2264,7 @@ async function* openaiStreamToAnthropic(
     toolCalls: ParsedRawToolCall[],
   ) {
     if (hasEmittedThinkingStart && !hasClosedThinking) {
+      throwIfStreamAborted(signal)
       yield { type: 'content_block_stop', index: contentBlockIndex }
       contentBlockIndex++
       hasClosedThinking = true
@@ -1770,6 +2274,7 @@ async function* openaiStreamToAnthropic(
     }
 
     for (const toolCall of toolCalls) {
+      throwIfStreamAborted(signal)
       const toolBlockIndex = contentBlockIndex
       yield {
         type: 'content_block_start',
@@ -1782,6 +2287,7 @@ async function* openaiStreamToAnthropic(
         },
       }
       contentBlockIndex++
+      throwIfStreamAborted(signal)
       yield {
         type: 'content_block_delta',
         index: toolBlockIndex,
@@ -1790,21 +2296,60 @@ async function* openaiStreamToAnthropic(
           partial_json: toolCall.argumentsJson,
         },
       }
+      throwIfStreamAborted(signal)
       yield { type: 'content_block_stop', index: toolBlockIndex }
       processStreamChunk(streamState, toolCall.argumentsJson)
     }
   }
 
   try {
-    while (true) {
-      const { done, value } = await readWithTimeout()
-      if (done) break
+    throwIfStreamAborted(signal)
 
+    // Emit message_start
+    yield {
+      type: 'message_start',
+      message: {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+      },
+    }
+
+    while (true) {
+      const { done, value } = await readWithIdleTimeout(reader, streamIdleTimeoutMs, {
+        signal,
+        cancelReader: readerCanceller.cancel,
+        onTimeout: () => {
+          const elapsed = Math.round((Date.now() - lastDataTime) / 1000)
+          logForDebugging(
+            `OpenAI-compatible SSE stream idle for ${elapsed}s (limit: ${streamIdleTimeoutMs / 1000}s). Connection likely dropped.`,
+            { level: 'error' },
+          )
+        },
+      })
+      if (done) {
+        streamComplete = true
+        break
+      }
+      if (value) lastDataTime = Date.now()
+
+      throwIfStreamAborted(signal)
       buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
 
       for (const line of lines) {
+      throwIfStreamAborted(signal)
       const trimmed = line.trim()
       if (!trimmed || trimmed === 'data: [DONE]') continue
       if (!trimmed.startsWith('data: ')) continue
@@ -1845,6 +2390,7 @@ async function* openaiStreamToAnthropic(
       const chunkUsage = convertChunkUsage(chunk.usage)
 
       for (const choice of chunk.choices ?? []) {
+        throwIfStreamAborted(signal)
         const delta = choice.delta
 
         // Reasoning models (e.g. GLM-5, DeepSeek) may stream chain-of-thought
@@ -1852,6 +2398,7 @@ async function* openaiStreamToAnthropic(
         // Emit reasoning as a thinking block and content as a text block.
         if (delta.reasoning_content != null && delta.reasoning_content !== '') {
           if (!hasEmittedThinkingStart) {
+            throwIfStreamAborted(signal)
             yield {
               type: 'content_block_start',
               index: contentBlockIndex,
@@ -1859,6 +2406,7 @@ async function* openaiStreamToAnthropic(
             }
             hasEmittedThinkingStart = true
           }
+          throwIfStreamAborted(signal)
           yield {
             type: 'content_block_delta',
             index: contentBlockIndex,
@@ -1871,6 +2419,7 @@ async function* openaiStreamToAnthropic(
         if (delta.content != null && delta.content !== '') {
           // Close thinking block if transitioning from reasoning to content
           if (hasEmittedThinkingStart && !hasClosedThinking) {
+            throwIfStreamAborted(signal)
             yield { type: 'content_block_stop', index: contentBlockIndex }
             contentBlockIndex++
             hasClosedThinking = true
@@ -1950,6 +2499,7 @@ async function* openaiStreamToAnthropic(
             if (tc.id && tc.function?.name) {
               // New tool call starting — close any open thinking block first
               if (hasEmittedThinkingStart && !hasClosedThinking) {
+                throwIfStreamAborted(signal)
                 yield { type: 'content_block_stop', index: contentBlockIndex }
                 contentBlockIndex++
                 hasClosedThinking = true
@@ -1960,6 +2510,7 @@ async function* openaiStreamToAnthropic(
               // instead of emitting during the streaming phase).
               if (isOllamaStream && ollamaTextBuffer) {
                 if (!hasEmittedContentStart) {
+                  throwIfStreamAborted(signal)
                   yield {
                     type: 'content_block_start',
                     index: contentBlockIndex,
@@ -1967,6 +2518,7 @@ async function* openaiStreamToAnthropic(
                   }
                   hasEmittedContentStart = true
                 }
+                throwIfStreamAborted(signal)
                 yield {
                   type: 'content_block_delta',
                   index: contentBlockIndex,
@@ -1998,6 +2550,7 @@ async function* openaiStreamToAnthropic(
                 normalizeAtStop,
               })
 
+              throwIfStreamAborted(signal)
               yield {
                 type: 'content_block_start',
                 index: toolBlockIndex,
@@ -2014,6 +2567,7 @@ async function* openaiStreamToAnthropic(
 
               // Emit any initial arguments
               if (tc.function.arguments && !normalizeAtStop) {
+                throwIfStreamAborted(signal)
                 yield {
                   type: 'content_block_delta',
                   index: toolBlockIndex,
@@ -2035,6 +2589,7 @@ async function* openaiStreamToAnthropic(
                   continue
                 }
 
+                throwIfStreamAborted(signal)
                 yield {
                   type: 'content_block_delta',
                   index: active.index,
@@ -2055,6 +2610,7 @@ async function* openaiStreamToAnthropic(
 
           // Close any open thinking block that wasn't closed by content transition
           if (hasEmittedThinkingStart && !hasClosedThinking) {
+            throwIfStreamAborted(signal)
             yield { type: 'content_block_stop', index: contentBlockIndex }
             contentBlockIndex++
             hasClosedThinking = true
@@ -2083,6 +2639,7 @@ async function* openaiStreamToAnthropic(
               if (hasEmittedContentStart) {
                 // Text block was already open — emit stripped prose then close it.
                 if (strippedVisible) {
+                  throwIfStreamAborted(signal)
                   yield {
                     type: 'content_block_delta',
                     index: contentBlockIndex,
@@ -2093,12 +2650,14 @@ async function* openaiStreamToAnthropic(
               } else if (strippedVisible) {
                 // Text was buffered (Ollama path, hasEmittedContentStart === false).
                 // Open a text block, emit the visible prose before the tool call, close it.
+                throwIfStreamAborted(signal)
                 yield {
                   type: 'content_block_start',
                   index: contentBlockIndex,
                   content_block: { type: 'text', text: '' },
                 }
                 hasEmittedContentStart = true
+                throwIfStreamAborted(signal)
                 yield {
                   type: 'content_block_delta',
                   index: contentBlockIndex,
@@ -2107,6 +2666,7 @@ async function* openaiStreamToAnthropic(
                 yield* closeActiveContentBlock()
               }
               for (const tc of textToolCalls) {
+                throwIfStreamAborted(signal)
                 const toolBlockIndex = contentBlockIndex
                 yield {
                   type: 'content_block_start',
@@ -2114,11 +2674,13 @@ async function* openaiStreamToAnthropic(
                   content_block: { type: 'tool_use', id: tc.id, name: tc.name, input: {} },
                 }
                 contentBlockIndex++
+                throwIfStreamAborted(signal)
                 yield {
                   type: 'content_block_delta',
                   index: toolBlockIndex,
                   delta: { type: 'input_json_delta', partial_json: JSON.stringify(tc.arguments) },
                 }
+                throwIfStreamAborted(signal)
                 yield { type: 'content_block_stop', index: toolBlockIndex }
               }
               // Only remap finish_reason to 'tool_calls' for the normal stop case;
@@ -2131,6 +2693,7 @@ async function* openaiStreamToAnthropic(
               // Open a text block first if one is not already open (guards the edge case
               // where hasEmittedContentStart is false but the buffer has content).
               if (!hasEmittedContentStart) {
+                throwIfStreamAborted(signal)
                 yield {
                   type: 'content_block_start',
                   index: contentBlockIndex,
@@ -2138,6 +2701,7 @@ async function* openaiStreamToAnthropic(
                 }
                 hasEmittedContentStart = true
               }
+              throwIfStreamAborted(signal)
               yield {
                 type: 'content_block_delta',
                 index: contentBlockIndex,
@@ -2168,6 +2732,7 @@ async function* openaiStreamToAnthropic(
                 xmlClosedContentBlock = true
               }
               for (const tc of calls) {
+                throwIfStreamAborted(signal)
                 const toolBlockIndex = contentBlockIndex
                 yield {
                   type: 'content_block_start',
@@ -2175,11 +2740,13 @@ async function* openaiStreamToAnthropic(
                   content_block: { type: 'tool_use', id: tc.id, name: tc.name, input: {} },
                 }
                 contentBlockIndex++
+                throwIfStreamAborted(signal)
                 yield {
                   type: 'content_block_delta',
                   index: toolBlockIndex,
                   delta: { type: 'input_json_delta', partial_json: JSON.stringify(tc.arguments) },
                 }
+                throwIfStreamAborted(signal)
                 yield { type: 'content_block_stop', index: toolBlockIndex }
               }
               if (originalFinishReason === 'stop') {
@@ -2235,6 +2802,7 @@ async function* openaiStreamToAnthropic(
                 }
               }
 
+              throwIfStreamAborted(signal)
               yield {
                 type: 'content_block_delta',
                 index: tc.index,
@@ -2243,6 +2811,7 @@ async function* openaiStreamToAnthropic(
                   partial_json: partialJson,
                 },
               }
+              throwIfStreamAborted(signal)
               yield { type: 'content_block_stop', index: tc.index }
               continue
             }
@@ -2264,6 +2833,7 @@ async function* openaiStreamToAnthropic(
             }
 
             if (suffixToAdd) {
+              throwIfStreamAborted(signal)
               yield {
                 type: 'content_block_delta',
                 index: tc.index,
@@ -2274,6 +2844,7 @@ async function* openaiStreamToAnthropic(
               }
             }
 
+            throwIfStreamAborted(signal)
             yield { type: 'content_block_stop', index: tc.index }
           }
 
@@ -2287,6 +2858,7 @@ async function* openaiStreamToAnthropic(
             // Gemini/Azure content safety filter blocked the response.
             // Emit a visible text block so the user knows why output was truncated.
             if (!hasEmittedContentStart) {
+              throwIfStreamAborted(signal)
               yield {
                 type: 'content_block_start',
                 index: contentBlockIndex,
@@ -2294,6 +2866,7 @@ async function* openaiStreamToAnthropic(
               }
               hasEmittedContentStart = true
             }
+            throwIfStreamAborted(signal)
             yield {
               type: 'content_block_delta',
               index: contentBlockIndex,
@@ -2305,6 +2878,7 @@ async function* openaiStreamToAnthropic(
             // detecting a stalled stream. Either way, the user should know
             // the answer they're seeing isn't complete.
             if (!hasEmittedContentStart) {
+              throwIfStreamAborted(signal)
               yield {
                 type: 'content_block_start',
                 index: contentBlockIndex,
@@ -2312,6 +2886,7 @@ async function* openaiStreamToAnthropic(
               }
               hasEmittedContentStart = true
             }
+            throwIfStreamAborted(signal)
             yield {
               type: 'content_block_delta',
               index: contentBlockIndex,
@@ -2320,6 +2895,7 @@ async function* openaiStreamToAnthropic(
           }
           lastStopReason = stopReason
 
+          throwIfStreamAborted(signal)
           yield {
             type: 'message_delta',
             delta: { stop_reason: stopReason, stop_sequence: null },
@@ -2337,6 +2913,7 @@ async function* openaiStreamToAnthropic(
         (chunk.choices?.length ?? 0) === 0 &&
         lastStopReason !== null
       ) {
+        throwIfStreamAborted(signal)
         yield {
           type: 'message_delta',
           delta: { stop_reason: lastStopReason, stop_sequence: null },
@@ -2347,6 +2924,10 @@ async function* openaiStreamToAnthropic(
     }
     }
   } finally {
+    if (!streamComplete || signal?.aborted) {
+      readerCanceller.cancel(createStreamAbortError())
+    }
+    readerCanceller.cleanup()
     reader.releaseLock()
   }
 
@@ -2364,6 +2945,7 @@ async function* openaiStreamToAnthropic(
     )
   }
 
+  throwIfStreamAborted(signal)
   yield { type: 'message_stop' }
 }
 
@@ -2372,16 +2954,84 @@ async function* openaiStreamToAnthropic(
 // ---------------------------------------------------------------------------
 
 class OpenAIShimStream {
-  private generator: AsyncGenerator<AnthropicStreamEvent>
+  private makeGenerator: (signal: AbortSignal) => AsyncGenerator<AnthropicStreamEvent>
+  private parentSignal?: AbortSignal
+  private generator?: AsyncGenerator<AnthropicStreamEvent>
+  private cleanupCombinedSignal?: () => void
+  private cleanupPreIterationAbort?: () => void
   // The controller property is checked by claude.ts to distinguish streams from error messages
   controller = new AbortController()
 
-  constructor(generator: AsyncGenerator<AnthropicStreamEvent>) {
-    this.generator = generator
+  constructor(
+    makeGenerator: (signal: AbortSignal) => AsyncGenerator<AnthropicStreamEvent>,
+    parentSignal?: AbortSignal,
+    cancelBeforeIteration?: () => void,
+  ) {
+    this.makeGenerator = makeGenerator
+    this.parentSignal = parentSignal
+
+    if (cancelBeforeIteration) {
+      let cleaned = false
+      let cancelled = false
+      let onAbort: () => void = () => {}
+      const cleanup = () => {
+        if (cleaned) return
+        cleaned = true
+        this.controller.signal.removeEventListener('abort', onAbort)
+        parentSignal?.removeEventListener('abort', onAbort)
+      }
+      onAbort = () => {
+        if (!this.generator && !cancelled) {
+          cancelled = true
+          cancelBeforeIteration()
+        }
+        cleanup()
+      }
+
+      this.controller.signal.addEventListener('abort', onAbort, { once: true })
+      parentSignal?.addEventListener('abort', onAbort, { once: true })
+      this.cleanupPreIterationAbort = cleanup
+
+      if (this.controller.signal.aborted || parentSignal?.aborted) {
+        onAbort()
+      }
+    }
+  }
+
+  private getGenerator(): AsyncGenerator<AnthropicStreamEvent> {
+    if (this.generator) {
+      return this.generator
+    }
+
+    this.cleanupPreIterationAbort?.()
+    this.cleanupPreIterationAbort = undefined
+
+    const combined = createCombinedAbortSignal(this.parentSignal, {
+      signalB: this.controller.signal,
+    })
+    this.cleanupCombinedSignal = combined.cleanup
+    this.generator = this.makeGenerator(combined.signal)
+    return this.generator
   }
 
   async *[Symbol.asyncIterator]() {
-    yield* this.generator
+    const generator = this.getGenerator()
+    let completed = false
+    try {
+      yield* generator
+      completed = true
+    } finally {
+      if (!completed && !this.controller.signal.aborted) {
+        this.controller.abort()
+      }
+      this.cleanupCombinedSignal?.()
+      this.cleanupCombinedSignal = undefined
+      this.cleanupPreIterationAbort?.()
+      this.cleanupPreIterationAbort = undefined
+      if (!completed) {
+        void generator.return?.(undefined).catch(() => {})
+      }
+    }
   }
 }
 
@@ -2431,18 +3081,24 @@ class OpenAIShimMessages {
         const isResponsesStream = response.url?.includes('/responses')
         const isMessagesStream = response.url?.includes('/messages')
         const isGeminiStream = response.url?.includes('/models/gemini-')
+        const cancelBeforeIteration = () => {
+          void response.body?.cancel(createStreamAbortError()).catch(() => {})
+        }
         return new OpenAIShimStream(
-          (
-            request.transport === 'codex_responses' ||
-            request.transport === 'responses' ||
-            isResponsesStream
-          )
-            ? codexStreamToAnthropic(response, request.resolvedModel, options?.signal)
-            : isMessagesStream
-              ? anthropicSsePassthrough(response, request.resolvedModel, options?.signal)
-              : isGeminiStream
-                ? geminiSseToAnthropic(response, request.resolvedModel, options?.signal)
-                : openaiStreamToAnthropic(response, request.resolvedModel, options?.signal, isLikelyOllamaEndpoint(request.baseUrl)),
+          streamSignal =>
+            (
+              request.transport === 'codex_responses' ||
+              request.transport === 'responses' ||
+              isResponsesStream
+            )
+              ? codexStreamToAnthropic(response, request.resolvedModel, streamSignal)
+              : isMessagesStream
+                ? anthropicSsePassthrough(response, request.resolvedModel, streamSignal)
+                : isGeminiStream
+                  ? geminiSseToAnthropic(response, request.resolvedModel, streamSignal)
+                  : openaiStreamToAnthropic(response, request.resolvedModel, streamSignal, isLikelyOllamaEndpoint(request.baseUrl)),
+          options?.signal,
+          cancelBeforeIteration,
         )
       }
 
@@ -2676,6 +3332,11 @@ class OpenAIShimMessages {
         : shimConfig.endpointPath?.startsWith('/models/gemini-')
           ? 'gemini'
           : request.transport
+    const useNativeOllamaChat =
+      effectiveTransport === 'chat_completions' &&
+      !shimConfig.endpointPath &&
+      isDirectLocalOllamaEndpoint(request.baseUrl) &&
+      isLikelyOllamaEndpoint(request.baseUrl)
     const openaiMessages = convertMessages(compressedMessages, params.system, {
       preserveReasoningContent: shimConfig.preserveReasoningContent,
       reasoningContentFallback: shimConfig.reasoningContentFallback,
@@ -3317,6 +3978,9 @@ class OpenAIShimMessages {
       if (shimConfig.endpointPath) {
         return `${baseUrl}${shimConfig.endpointPath}`
       }
+      if (useNativeOllamaChat) {
+        return buildOllamaChatUrl(baseUrl)
+      }
       return request.transport === 'responses' || request.transport === 'responses_compat'
         ? `${baseUrl}/responses`
         : buildChatCompletionsUrl(baseUrl)
@@ -3381,9 +4045,31 @@ class OpenAIShimMessages {
     // Local backends do not implement prefix caching, so the deep key-sort
     // is pure CPU overhead per request (issue #1016). Drop to the native
     // `JSON.stringify` fast path when the fast-path config opts out.
+    const buildOllamaChatBody = (): Record<string, unknown> => {
+      const options: Record<string, unknown> = {
+        num_ctx: getOllamaNumCtx(),
+      }
+      if (body.max_tokens !== undefined) {
+        options.num_predict = body.max_tokens
+      } else if (body.max_completion_tokens !== undefined) {
+        options.num_predict = body.max_completion_tokens
+      }
+      if (params.temperature !== undefined) options.temperature = params.temperature
+      if (params.top_p !== undefined) options.top_p = params.top_p
+
+      return {
+        model: request.resolvedModel,
+        messages: normalizeOllamaNativeMessages(body.messages),
+        stream: params.stream ?? false,
+        options,
+        ...(body.tools ? { tools: body.tools } : {}),
+      }
+    }
+
     const serializeBody = (): string => {
       const payload =
-        effectiveTransport === 'responses' || effectiveTransport === 'responses_compat' ? buildResponsesBody()
+        useNativeOllamaChat ? buildOllamaChatBody()
+          : effectiveTransport === 'responses' || effectiveTransport === 'responses_compat' ? buildResponsesBody()
           : effectiveTransport === 'anthropic_messages' ? buildAnthropicMessagesBody()
           : effectiveTransport === 'gemini' ? buildGeminiBody()
           : body
@@ -3551,6 +4237,11 @@ class OpenAIShimMessages {
 
       if (response.ok) {
         credentialPool?.reportSuccess(credentialLease)
+        if (useNativeOllamaChat) {
+          response = params.stream
+            ? convertOllamaStreamingResponse(response, request.resolvedModel)
+            : await convertOllamaNonStreamingResponse(response, request.resolvedModel)
+        }
         let tokensIn = 0
         let tokensOut = 0
         // Skip clone() for streaming responses - it blocks until full body is received,
@@ -4018,4 +4709,9 @@ export function createOpenAIShimClient(options: {
 }
 
 // Test-only surface (same pattern as WebSearchTool's __test export).
-export const __test = { convertMessages }
+export const __test = {
+  convertMessages,
+  getStreamIdleTimeoutMs,
+  readWithIdleTimeout,
+  StreamIdleTimeoutError,
+}
