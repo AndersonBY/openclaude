@@ -160,4 +160,103 @@ describe('interpretCommandResult', () => {
       expect(result.isError).toBe(true)
     })
   })
+
+  // --- ruff / eslint (linters) + uvx / npx wrappers ---
+  describe('linters and wrappers', () => {
+    test('ruff exit code 0 = clean', () => {
+      const result = interpretCommandResult('ruff check .', 0, '', '')
+      expect(result.isError).toBe(false)
+    })
+
+    test('ruff exit code 1 = violations found (not error)', () => {
+      const result = interpretCommandResult('ruff check --fix', 1, 'F401 imported but unused\n', '')
+      expect(result.isError).toBe(false)
+      expect(result.message).toContain('violations')
+    })
+
+    test('ruff exit code 2 = real error', () => {
+      const result = interpretCommandResult('ruff check .', 2, '', 'invalid pyproject config')
+      expect(result.isError).toBe(true)
+    })
+
+    test('eslint exit code 1 = lint problems (not error)', () => {
+      const result = interpretCommandResult('eslint src/', 1, '', '')
+      expect(result.isError).toBe(false)
+    })
+
+    test('eslint exit code 2 = fatal config error', () => {
+      const result = interpretCommandResult('eslint src/', 2, '', 'Cannot read config file')
+      expect(result.isError).toBe(true)
+    })
+
+    test('uvx ruff inherits ruff semantics: exit 1 not error', () => {
+      const result = interpretCommandResult('uvx ruff check --fix', 1, '', '')
+      expect(result.isError).toBe(false)
+    })
+
+    test('npx eslint inherits eslint semantics: exit 1 not error', () => {
+      const result = interpretCommandResult('npx eslint .', 1, '', '')
+      expect(result.isError).toBe(false)
+    })
+
+    test('npx with flags before the tool still unwraps: exit 1 not error', () => {
+      const result = interpretCommandResult('npx -y eslint .', 1, '', '')
+      expect(result.isError).toBe(false)
+    })
+
+    test('uvx wrapping an unrecognized tool falls back to default: exit 1 = error', () => {
+      const result = interpretCommandResult('uvx somecli run', 1, '', '')
+      expect(result.isError).toBe(true)
+    })
+
+    test('bare npx with no recognized tool uses default semantics', () => {
+      const result = interpretCommandResult('npx', 1, '', '')
+      expect(result.isError).toBe(true)
+    })
+
+    test('path-prefixed eslint inherits lint semantics: exit 1 not error', () => {
+      const result = interpretCommandResult(
+        './node_modules/.bin/eslint .',
+        1,
+        '',
+        '',
+      )
+      expect(result.isError).toBe(false)
+    })
+
+    test('quoted linter inherits lint semantics: exit 1 not error', () => {
+      const result = interpretCommandResult('"ruff" check .', 1, '', '')
+      expect(result.isError).toBe(false)
+    })
+
+    test('path-prefixed uvx wrapper unwraps to ruff: exit 1 not error', () => {
+      const result = interpretCommandResult(
+        '/usr/bin/uvx ruff check --fix',
+        1,
+        '',
+        '',
+      )
+      expect(result.isError).toBe(false)
+    })
+
+    test('npx wrapping a path-prefixed eslint unwraps: exit 1 not error', () => {
+      const result = interpretCommandResult(
+        'npx ./node_modules/.bin/eslint .',
+        1,
+        '',
+        '',
+      )
+      expect(result.isError).toBe(false)
+    })
+
+    test('path-prefixed linter still surfaces a real error: exit 2 = error', () => {
+      const result = interpretCommandResult(
+        './node_modules/.bin/eslint .',
+        2,
+        '',
+        'Invalid config',
+      )
+      expect(result.isError).toBe(true)
+    })
+  })
 })

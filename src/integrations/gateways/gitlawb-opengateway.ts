@@ -1,4 +1,5 @@
 import { defineGateway } from '../define.js'
+import { ZAI_GLM_OPENAI_SHIM } from '../transport/zaiGlmShim.js'
 
 export default defineGateway({
   id: 'gitlawb-opengateway',
@@ -115,6 +116,13 @@ export default defineGateway({
         apiName: 'z-ai/glm-5.2',
         label: 'GLM 5.2 (via Opengateway)',
         modelDescriptorId: 'glm-5.2',
+        transportOverrides: {
+          openaiShim: {
+            ...ZAI_GLM_OPENAI_SHIM,
+            maxTokensField: 'max_completion_tokens',
+            removeBodyFields: ['store', 'stream_options'],
+          },
+        },
       },
       // OpenRouter :free endpoint — bills $0 and bypasses the gateway credit
       // gate, so it works even with an empty credit balance.
@@ -123,6 +131,13 @@ export default defineGateway({
         apiName: 'nvidia/nemotron-3-ultra-550b-a55b:free',
         label: 'Nemotron 3 Ultra Free (via Opengateway)',
         modelDescriptorId: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+        notes: 'Free',
+      },
+      {
+        id: 'opengateway-tencent-hy3',
+        apiName: 'tencent/hy3',
+        label: 'Tencent HY3 Free (via Opengateway)',
+        modelDescriptorId: 'tencent/hy3',
         notes: 'Free',
       },
     ],

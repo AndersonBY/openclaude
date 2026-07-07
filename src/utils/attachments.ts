@@ -3,6 +3,7 @@ import {
   logEvent,
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
 } from 'src/services/analytics/index.js'
+import { getFileExtensionForAnalytics } from 'src/services/analytics/metadata.js'
 import {
   toolMatchesName,
   type Tools,
@@ -187,9 +188,12 @@ import {
 } from './hooks/AsyncHookRegistry.js'
 import {
   checkForLSPDiagnostics,
-  clearAllLSPDiagnostics,
+  DIAGNOSTIC_DELIVERY_DEBOUNCE_MS,
+  getNextLSPDiagnosticDeliveryDelay,
+  type LSPDiagnosticSet,
 } from '../services/lsp/LSPDiagnosticRegistry.js'
 import { logForDebugging } from './debug.js'
+import { sleep } from './sleep.js'
 import {
   extractTextContent,
   getUserMessageText,
@@ -2086,6 +2090,54 @@ async function processMcpResourceAttachments(
   ) as Attachment[]
 }
 
+// Read a changed/watched image file for a background diff attachment.
+//
+// Contract: this path DEGRADES on any failure — returning null skips the
+// attachment rather than interrupting the turn. That deliberately includes
+// ImageProcessorUnavailableError (no image processor installed): a background
+// attachment must never abort the conversation over a missing optional package.
+// The explicit FileReadTool path is the opposite — it lets that error surface so
+// the user sees the install hint when they directly read an image.
+export async function tryReadEditedImageAttachment(
+  normalizedPath: string,
+  // Injectable for tests so the degrade path (and its sanitized telemetry) can
+  // be exercised for a specific error type without a real file.
+  deps: {
+    read?: typeof readImageWithTokenBudget
+    log?: typeof logError
+    track?: typeof logEvent
+  } = {},
+): Promise<{
+  type: 'edited_image_file'
+  filename: string
+  content: Awaited<ReturnType<typeof readImageWithTokenBudget>>
+} | null> {
+  const read = deps.read ?? readImageWithTokenBudget
+  const log = deps.log ?? logError
+  const track = deps.track ?? logEvent
+  try {
+    const data = await read(normalizedPath)
+    return {
+      type: 'edited_image_file' as const,
+      filename: normalizedPath,
+      content: data,
+    }
+  } catch (compressionError) {
+    // Log only the error TYPE, never the raw error: readImageWithTokenBudget can
+    // throw path-bearing messages/stacks (e.g. "Image file is empty: <path>"),
+    // and logError persists message/stack, which would leak local file paths.
+    const errorName =
+      compressionError instanceof Error ? compressionError.name : 'UnknownError'
+    log(new Error(`watched-file image attachment skipped (${errorName})`))
+    // Likewise only the file extension goes to analytics — never the path.
+    const analyticsExt = getFileExtensionForAnalytics(normalizedPath)
+    track('tengu_watched_file_compression_failed', {
+      ...(analyticsExt !== undefined && { ext: analyticsExt }),
+    })
+    return null
+  }
+}
+
 export async function getChangedFiles(
   toolUseContext: ToolUseContext,
 ): Promise<Attachment[]> {
@@ -2147,22 +2199,10 @@ export async function getChangedFiles(
           }
         }
 
-        // For non-text files (images), apply the same token limit logic as FileReadTool
+        // For non-text files (images), apply the same token limit logic as
+        // FileReadTool. Degrades to null on failure (see the helper's contract).
         if (result.data.type === 'image') {
-          try {
-            const data = await readImageWithTokenBudget(normalizedPath)
-            return {
-              type: 'edited_image_file' as const,
-              filename: normalizedPath,
-              content: data,
-            }
-          } catch (compressionError) {
-            logError(compressionError)
-            logEvent('tengu_watched_file_compression_failed', {
-              file: normalizedPath,
-            } as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS)
-            return null
-          }
+          return tryReadEditedImageAttachment(normalizedPath)
         }
 
         // notebook / pdf / parts — no diff representation; explicitly
@@ -2932,8 +2972,57 @@ async function getDiagnosticAttachments(
  * Get LSP diagnostic attachments from passive LSP servers.
  * Follows the AsyncHookRegistry pattern for consistent async attachment delivery.
  */
+type LSPDiagnosticAttachmentDeps = {
+  now?: () => number
+  wait?: (ms: number, signal?: AbortSignal) => Promise<void>
+}
+
+const LSP_DIAGNOSTIC_ATTACHMENT_MAX_WAIT_MS = DIAGNOSTIC_DELIVERY_DEBOUNCE_MS
+
+function getLSPDiagnosticCheckOptions(now?: () => number): {
+  respectDebounce: true
+  now?: number
+} {
+  const currentTime = now?.()
+  return currentTime === undefined
+    ? { respectDebounce: true }
+    : { respectDebounce: true, now: currentTime }
+}
+
+async function checkForStableLSPDiagnosticsAtQueryBoundary(
+  toolUseContext: ToolUseContext,
+  deps: LSPDiagnosticAttachmentDeps,
+): Promise<LSPDiagnosticSet[]> {
+  const diagnosticSets = checkForLSPDiagnostics(
+    getLSPDiagnosticCheckOptions(deps.now),
+  )
+  if (diagnosticSets.length > 0) {
+    return diagnosticSets
+  }
+
+  const nextDelay = getNextLSPDiagnosticDeliveryDelay(deps.now?.())
+  if (nextDelay === null) {
+    return []
+  }
+
+  const waitMs = Math.min(nextDelay, LSP_DIAGNOSTIC_ATTACHMENT_MAX_WAIT_MS)
+  if (waitMs > 0) {
+    logForDebugging(
+      `LSP Diagnostics: Waiting ${waitMs}ms for pending diagnostics to stabilize`,
+    )
+    const wait =
+      deps.wait ??
+      ((ms: number, signal?: AbortSignal) =>
+        sleep(ms, signal, { unref: true }))
+    await wait(waitMs, toolUseContext.abortController.signal)
+  }
+
+  return checkForLSPDiagnostics(getLSPDiagnosticCheckOptions(deps.now))
+}
+
 async function getLSPDiagnosticAttachments(
   toolUseContext: ToolUseContext,
+  deps: LSPDiagnosticAttachmentDeps = {},
 ): Promise<Attachment[]> {
   // LSP diagnostics are only useful if the agent has the Bash tool to act on them
   if (
@@ -2945,9 +3034,31 @@ async function getLSPDiagnosticAttachments(
   logForDebugging('LSP Diagnostics: getLSPDiagnosticAttachments called')
 
   try {
-    const diagnosticSets = checkForLSPDiagnostics()
+    const diagnosticSets = await checkForStableLSPDiagnosticsAtQueryBoundary(
+      toolUseContext,
+      deps,
+    )
 
     if (diagnosticSets.length === 0) {
+      return []
+    }
+
+    // checkForLSPDiagnostics normally enforces this invariant. Keep a final
+    // attachment-boundary guard so future registry changes cannot send empty
+    // diagnostics attachments to the model.
+    const finalDiagnosticCount = diagnosticSets.reduce(
+      (count, set) =>
+        count +
+        set.files.reduce(
+          (fileCount, file) => fileCount + file.diagnostics.length,
+          0,
+        ),
+      0,
+    )
+    if (finalDiagnosticCount === 0) {
+      logForDebugging(
+        `LSP Diagnostics: No diagnostic attachments to return after filtering empty diagnostic payloads`,
+      )
       return []
     }
 
@@ -2962,15 +3073,6 @@ async function getLSPDiagnosticAttachments(
       isNew: true,
     }))
 
-    // Clear delivered diagnostics from registry to prevent memory leak
-    // Follows same pattern as removeDeliveredAsyncHooks
-    if (diagnosticSets.length > 0) {
-      clearAllLSPDiagnostics()
-      logForDebugging(
-        `LSP Diagnostics: Cleared ${diagnosticSets.length} delivered diagnostic(s) from registry`,
-      )
-    }
-
     logForDebugging(
       `LSP Diagnostics: Returning ${attachments.length} diagnostic attachment(s)`,
     )
@@ -2984,6 +3086,10 @@ async function getLSPDiagnosticAttachments(
     // Return empty array to allow other attachments to proceed
     return []
   }
+}
+
+export const __test = {
+  getLSPDiagnosticAttachments,
 }
 
 export async function* getAttachmentMessages(

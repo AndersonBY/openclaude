@@ -20,6 +20,11 @@
  *   OPENAI_MODEL=gpt-4o              — default model override
  *   CODEX_API_KEY / ~/.codex/auth.json — Codex auth for codexplan/codexspark
  *
+ * Smart auto-routing (opt-in; startup defaults, overridden by settings.smartRouting):
+ *   OPENCLAUDE_SMART_ROUTING=1|true   — route simple turns to a cheaper model
+ *   OPENCLAUDE_SMART_ROUTING_SIMPLE=<key> — agentModels key or model id for simple turns
+ *   OPENCLAUDE_SMART_ROUTING_STRONG=<key> — agentModels key or model id for strong turns
+ *
  * GitHub Copilot API (api.githubcopilot.com), OpenAI-compatible:
  *   CLAUDE_CODE_USE_GITHUB=1         — enable GitHub inference (no need for USE_OPENAI)
  *   GITHUB_TOKEN or GH_TOKEN         — Copilot API token (mapped to Bearer auth)
@@ -92,7 +97,10 @@ import {
 } from './openaiErrorClassification.js'
 import { sanitizeSchemaForOpenAICompat } from '../../utils/schemaSanitizer.js'
 import { redactSecretValueForDisplay, type SecretValueSource } from '../../utils/providerProfile.js'
-import { shouldRedactUrlQueryParam } from '../../utils/urlRedaction.js'
+import {
+  redactUrlForDisplay,
+  shouldRedactUrlQueryParam,
+} from '../../utils/redaction.js'
 import { createCombinedAbortSignal } from '../../utils/combinedAbortSignal.js'
 import {
   normalizeToolArguments,
@@ -345,32 +353,28 @@ function hasCerebrasApiHost(baseUrl: string | undefined): boolean {
   }
 }
 
+export function hasMistralApiHost(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase()
+    return host === 'api.mistral.ai' || host.endsWith('.mistral.ai')
+  } catch {
+    return false
+  }
+}
+
 function formatRetryAfterHint(response: Response): string {
   const ra = response.headers.get('retry-after')
   return ra ? ` (Retry-After: ${ra})` : ''
 }
 
 function redactUrlForDiagnostics(url: string): string {
-  try {
-    const parsed = new URL(url)
-    if (parsed.username) {
-      parsed.username = 'redacted'
-    }
-    if (parsed.password) {
-      parsed.password = 'redacted'
-    }
-
-    for (const key of parsed.searchParams.keys()) {
-      if (shouldRedactUrlQueryParam(key)) {
-        parsed.searchParams.set(key, 'redacted')
-      }
-    }
-
-    const serialized = parsed.toString()
-    return redactSecretValueForDisplay(serialized, process.env as SecretValueSource) ?? serialized
-  } catch {
-    return redactSecretValueForDisplay(url, process.env as SecretValueSource) ?? url
-  }
+  const redacted = redactUrlForDisplay(url)
+  return (
+    redactSecretValueForDisplay(redacted, process.env as SecretValueSource) ??
+    redacted
+  )
 }
 
 function redactUrlsInMessage(message: string): string {
@@ -1106,34 +1110,40 @@ function convertMessages(
     if (role === 'user') {
       // Check for tool_result blocks in user messages
       if (Array.isArray(content)) {
-        const toolResults = content.filter(
-          (b: { type?: string }) => b.type === 'tool_result',
-        )
-        const otherContent = content.filter(
-          (b: { type?: string }) => b.type !== 'tool_result',
-        )
+        let otherContent: unknown[] | undefined
 
         // Emit tool results as tool messages, but ONLY if we have a matching tool_use ID.
         // Mistral/OpenAI strictly require tool messages to follow an assistant message with tool_calls.
         // If the user interrupted (ESC) and a synthetic tool_result was generated without a recorded tool_use,
         // emitting it here would cause a "role must alternate" or "unexpected role" error.
-        for (const tr of toolResults) {
-          const id = tr.tool_use_id ?? 'unknown'
-          if (knownToolCallIds.has(id)) {
-            result.push({
-              role: 'tool',
-              tool_call_id: id,
-              content: convertToolResultContent(tr.content, tr.is_error),
-            })
+        for (const block of content) {
+          const blockType = (block as { type?: string }).type
+          if (blockType === 'tool_result') {
+            const tr = block as {
+              tool_use_id?: string
+              content?: unknown
+              is_error?: boolean
+            }
+            const id = tr.tool_use_id ?? 'unknown'
+            if (knownToolCallIds.has(id)) {
+              result.push({
+                role: 'tool',
+                tool_call_id: id,
+                content: convertToolResultContent(tr.content, tr.is_error),
+              })
+            } else {
+              logForDebugging(
+                `Dropping orphan tool_result for ID: ${id} to prevent API error`,
+              )
+            }
           } else {
-            logForDebugging(
-              `Dropping orphan tool_result for ID: ${id} to prevent API error`,
-            )
+            otherContent ??= []
+            otherContent.push(block)
           }
         }
 
         // Emit remaining user content
-        if (otherContent.length > 0) {
+        if (otherContent && otherContent.length > 0) {
           result.push({
             role: 'user',
             content: convertContentBlocks(otherContent),
@@ -1148,25 +1158,51 @@ function convertMessages(
     } else if (role === 'assistant') {
       // Check for tool_use blocks
       if (Array.isArray(content)) {
-        const toolUses = content.filter(
-          (b: { type?: string }) => b.type === 'tool_use',
-        )
-        const thinkingBlock = content.find(
-          (b: { type?: string }) =>
-            b.type === 'thinking' ||
-            b.type === 'redacted_thinking',
-        )
-        const textContent = content.filter(
-          (b: { type?: string }) =>
-            b.type !== 'tool_use' &&
-            b.type !== 'thinking' &&
-            b.type !== 'redacted_thinking',
-        )
+        let toolUses: Array<{
+          id?: string
+          name?: string
+          input?: unknown
+          extra_content?: Record<string, unknown>
+          signature?: string
+        }> | undefined
+        let thinkingBlock:
+          | { type?: string; thinking?: string; data?: string; signature?: string }
+          | undefined
+        let textContent: unknown[] | undefined
+
+        for (const block of content) {
+          const blockType = (block as { type?: string }).type
+          if (blockType === 'tool_use') {
+            toolUses ??= []
+            toolUses.push(
+              block as {
+                id?: string
+                name?: string
+                input?: unknown
+                extra_content?: Record<string, unknown>
+                signature?: string
+              },
+            )
+          } else if (
+            blockType === 'thinking' ||
+            blockType === 'redacted_thinking'
+          ) {
+            thinkingBlock ??= block as {
+              type?: string
+              thinking?: string
+              data?: string
+              signature?: string
+            }
+          } else {
+            textContent ??= []
+            textContent.push(block)
+          }
+        }
 
         const assistantMsg: OpenAIMessage = {
           role: 'assistant',
           content: (() => {
-            const c = convertContentBlocks(textContent)
+            const c = convertContentBlocks(textContent ?? [])
             return typeof c === 'string'
               ? c
               : Array.isArray(c)
@@ -1188,82 +1224,70 @@ function convertMessages(
           // blocks carry it in `.data` (see token estimation and message-size
           // accounting). Read the right field per type so a real redacted block
           // with non-empty content is not silently dropped to "".
-          const block = thinkingBlock as
-            | { type?: string; thinking?: string; data?: string }
-            | undefined
           const thinkingText =
-            block?.type === 'redacted_thinking'
-              ? block?.data
-              : block?.thinking
+            thinkingBlock?.type === 'redacted_thinking'
+              ? thinkingBlock?.data
+              : thinkingBlock?.thinking
           if (typeof thinkingText === 'string' && thinkingText.trim().length > 0) {
             assistantMsg.reasoning_content = thinkingText
           } else if (
-            toolUses.length > 0 &&
+            (toolUses?.length ?? 0) > 0 &&
             reasoningContentFallback === ''
           ) {
             assistantMsg.reasoning_content = ''
           }
         }
 
-        if (toolUses.length > 0) {
-          const mappedToolCalls = toolUses
-            .map(
-              (tu: {
-                id?: string
-                name?: string
-                input?: unknown
-                extra_content?: Record<string, unknown>
-                signature?: string
-              }) => {
-                const id = tu.id ?? `call_${crypto.randomUUID().replace(/-/g, '')}`
+        if (toolUses && toolUses.length > 0) {
+          const mappedToolCalls: NonNullable<OpenAIMessage['tool_calls']> = []
+          for (const tu of toolUses) {
+            const id = tu.id ?? `call_${crypto.randomUUID().replace(/-/g, '')}`
 
-                // Only keep tool calls that have a corresponding result in the history,
-                // or if it's the last message (prefill scenario).
-                // Orphaned tool calls (e.g. from user interruption) cause 400 errors.
-                if (!toolResultIds.has(id) && !isLastInHistory) {
-                  return null
-                }
+            // Only keep tool calls that have a corresponding result in the history,
+            // or if it's the last message (prefill scenario).
+            // Orphaned tool calls (e.g. from user interruption) cause 400 errors.
+            if (!toolResultIds.has(id) && !isLastInHistory) {
+              continue
+            }
 
-                knownToolCallIds.add(id)
-                const toolCall: NonNullable<
-                  OpenAIMessage['tool_calls']
-                >[number] = {
-                  id,
-                  type: 'function' as const,
-                  function: {
-                    name: tu.name ?? 'unknown',
-                    arguments:
-                      typeof tu.input === 'string'
-                        ? tu.input
-                        : JSON.stringify(tu.input ?? {}),
-                  },
-                }
-
-                // Preserve existing extra_content if present
-                if (tu.extra_content) {
-                  toolCall.extra_content = { ...tu.extra_content }
-                }
-
-                // Gemini OpenAI-compatible endpoints require Google's
-                // thought_signature to be replayed with prior function-call
-                // parts. Preserve only real signatures received from the
-                // provider; synthetic placeholders are rejected by GMI.
-                if (preserveGeminiThoughtSignature) {
-                  const signature =
-                    tu.signature ??
-                    geminiThoughtSignatureFromExtraContent(tu.extra_content) ??
-                    (thinkingBlock as { signature?: string } | undefined)?.signature
-
-                  toolCall.extra_content = mergeGeminiThoughtSignature(
-                    toolCall.extra_content,
-                    signature,
-                  )
-                }
-
-                return toolCall
+            knownToolCallIds.add(id)
+            const toolCall: NonNullable<
+              OpenAIMessage['tool_calls']
+            >[number] = {
+              id,
+              type: 'function' as const,
+              function: {
+                name: tu.name ?? 'unknown',
+                arguments:
+                  typeof tu.input === 'string'
+                    ? tu.input
+                    : JSON.stringify(tu.input ?? {}),
               },
-            )
-            .filter((tc): tc is NonNullable<typeof tc> => tc !== null)
+            }
+
+            // Preserve existing extra_content if present
+            if (tu.extra_content) {
+              toolCall.extra_content = { ...tu.extra_content }
+            }
+
+            // Gemini OpenAI-compatible endpoints require Google's
+            // thought_signature to be replayed with prior function-call
+            // parts. Preserve only real signatures received from the
+            // provider; synthetic placeholders are rejected by GMI.
+            if (preserveGeminiThoughtSignature) {
+              const signature =
+                tu.signature ??
+                geminiThoughtSignatureFromExtraContent(tu.extra_content) ??
+                thinkingBlock?.signature
+
+              toolCall.extra_content = mergeGeminiThoughtSignature(
+                toolCall.extra_content,
+                signature,
+              )
+            }
+
+            mappedToolCalls.push(toolCall)
+          }
 
           if (mappedToolCalls.length > 0) {
             assistantMsg.tool_calls = mappedToolCalls
@@ -2161,11 +2185,185 @@ async function* geminiSseToAnthropic(
   }
 }
 
+type NonStreamingOpenAIResponse = {
+  id?: string
+  model?: string
+  choices?: Array<{
+    message?: {
+      role?: string
+      content?: string | null | Array<{ type?: string; text?: string }>
+      reasoning_content?: string | null
+      extra_content?: Record<string, unknown>
+      tool_calls?: Array<{
+        id: string
+        function: { name: string; arguments: string }
+        extra_content?: Record<string, unknown>
+      }>
+    }
+    finish_reason?: string
+  }>
+  usage?: {
+    prompt_tokens?: number
+    completion_tokens?: number
+    prompt_tokens_details?: {
+      cached_tokens?: number
+    }
+  }
+}
+
+/**
+ * Convert an OpenAI-compatible non-streaming chat completion into an
+ * Anthropic-shaped message. Shared by the `OpenAIShimMessages` non-stream path
+ * and the `application/json` fallback inside `openaiStreamToAnthropic` so both
+ * apply the same tool-call extraction, stop-reason mapping, array-content
+ * normalization, <think>-tag stripping, and raw text tool-call recovery.
+ */
+function convertNonStreamingResponseToAnthropicMessage(
+  data: NonStreamingOpenAIResponse,
+  model: string,
+) {
+  const choice = data.choices?.[0]
+  const content: Array<Record<string, unknown>> = []
+  // An empty tool_calls array is still truthy; treat it as "no structured tool
+  // calls" so raw "Tool calls requested" text recovery is not skipped.
+  const hasStructuredToolCalls =
+    (choice?.message?.tool_calls?.length ?? 0) > 0
+
+  // Some reasoning models (e.g. GLM-5) put their chain-of-thought in
+  // reasoning_content while content stays null. Preserve it as a thinking
+  // block, but do not surface it as visible assistant text.
+  const reasoningText = choice?.message?.reasoning_content
+  if (typeof reasoningText === 'string' && reasoningText) {
+    content.push({ type: 'thinking', thinking: reasoningText })
+  }
+  const rawContent =
+    choice?.message?.content !== '' && choice?.message?.content != null
+      ? choice?.message?.content
+      : null
+  if (typeof rawContent === 'string' && rawContent) {
+    const strippedContent = stripThinkTags(rawContent)
+    const rawToolCalls = hasStructuredToolCalls
+      ? null
+      : parseRawToolCallsRequestedText(strippedContent)
+    if (rawToolCalls) {
+      for (const toolCall of rawToolCalls) {
+        content.push({
+          type: 'tool_use',
+          id: toolCall.id,
+          name: toolCall.name,
+          input: JSON.parse(toolCall.argumentsJson),
+        })
+      }
+    } else {
+      content.push({
+        type: 'text',
+        text: strippedContent,
+      })
+    }
+  } else if (Array.isArray(rawContent) && rawContent.length > 0) {
+    const parts: string[] = []
+    for (const part of rawContent) {
+      if (
+        part &&
+        typeof part === 'object' &&
+        part.type === 'text' &&
+        typeof part.text === 'string'
+      ) {
+        parts.push(part.text)
+      }
+    }
+    const joined = parts.join('\n')
+    if (joined) {
+      const strippedContent = stripThinkTags(joined)
+      const rawToolCalls = hasStructuredToolCalls
+        ? null
+        : parseRawToolCallsRequestedText(strippedContent)
+      if (rawToolCalls) {
+        for (const toolCall of rawToolCalls) {
+          content.push({
+            type: 'tool_use',
+            id: toolCall.id,
+            name: toolCall.name,
+            input: JSON.parse(toolCall.argumentsJson),
+          })
+        }
+      } else {
+        content.push({
+          type: 'text',
+          text: strippedContent,
+        })
+      }
+    }
+  }
+
+  if (hasStructuredToolCalls && choice?.message?.tool_calls) {
+    for (const tc of choice.message.tool_calls) {
+      const input = normalizeToolArguments(
+        tc.function.name,
+        tc.function.arguments,
+      )
+      const toolExtraContent = tc.extra_content ?? choice.message.extra_content
+      const toolSignature =
+        geminiThoughtSignatureFromExtraContent(tc.extra_content) ??
+        geminiThoughtSignatureFromExtraContent(choice.message.extra_content)
+      const mergedToolExtraContent = mergeGeminiThoughtSignature(
+        toolExtraContent,
+        toolSignature,
+      )
+      content.push({
+        type: 'tool_use',
+        id: tc.id,
+        name: tc.function.name,
+        input,
+        ...(mergedToolExtraContent ? { extra_content: mergedToolExtraContent } : {}),
+        ...(toolSignature ? { signature: toolSignature } : {}),
+      })
+    }
+  }
+
+  const stopReason =
+    choice?.finish_reason === 'tool_calls' ||
+    content.some(block => block.type === 'tool_use')
+      ? 'tool_use'
+      : choice?.finish_reason === 'length'
+        ? 'max_tokens'
+        : 'end_turn'
+
+  if (choice?.finish_reason === 'content_filter' || choice?.finish_reason === 'safety') {
+    content.push({
+      type: 'text',
+      text: '\n\n[Content blocked by provider safety filter]',
+    })
+  }
+
+  return {
+    id: data.id ?? makeMessageId(),
+    type: 'message',
+    role: 'assistant',
+    content,
+    model: data.model ?? model,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: buildAnthropicUsageFromRawUsage(
+      data.usage as unknown as Record<string, unknown> | undefined,
+    ),
+  }
+}
+
+function headersWithRequestUrl(headers: Headers, requestUrl?: string): Headers {
+  const next = new Headers(headers)
+  if (requestUrl) {
+    next.set('x-opencode-request-url', requestUrl)
+  }
+  return next
+}
+
 async function* openaiStreamToAnthropic(
   response: Response,
   model: string,
   signal?: AbortSignal,
   isOllama = false,
+  requestUrl?: string,
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
   let contentBlockIndex = 0
@@ -2202,6 +2400,124 @@ async function* openaiStreamToAnthropic(
   // xmlHoldback retains a trailing partial opener split across deltas.
   let xmlToolCallText: string | null = null
   let xmlHoldback = ''
+
+  const contentType = response.headers.get('content-type') ?? ''
+  if (contentType.includes('application/json')) {
+    const text = await response.text().catch(() => '')
+    let parsed: any
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      throw APIError.generate(
+        response.status,
+        undefined,
+        `Unexpected JSON response from provider: ${text}`,
+        response.headers as unknown as Headers,
+      )
+    }
+
+    if (parsed && typeof parsed === 'object' && parsed.error) {
+      const errorMsg =
+        parsed.error && typeof parsed.error === 'object' && 'type' in parsed.error
+          ? JSON.stringify(parsed.error)
+          : parsed.error.message || JSON.stringify(parsed.error)
+      const failure = classifyOpenAIHttpFailure({
+        status: response.status,
+        body: text,
+        url: requestUrl ?? response.url,
+      })
+      throw APIError.generate(
+        response.status,
+        parsed,
+        buildOpenAICompatibilityErrorMessage(
+          `OpenAI API error ${response.status}: ${errorMsg}`,
+          { ...failure, requestUrl: requestUrl ?? response.url },
+        ),
+        headersWithRequestUrl(response.headers, requestUrl ?? response.url),
+      )
+    }
+
+    // Some providers ignore `stream: true` and return a normal JSON chat
+    // completion. Route it through the shared non-streaming converter so this
+    // fallback preserves tool_calls, Anthropic stop-reason mapping, array
+    // content normalization, <think>-tag stripping, and raw text tool-call
+    // recovery — then re-emit the resulting message as stream events.
+    const message = convertNonStreamingResponseToAnthropicMessage(parsed, model)
+
+    yield {
+      type: 'message_start',
+      message: {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+      },
+    }
+
+    for (const block of message.content) {
+      if (block.type === 'thinking') {
+        yield {
+          type: 'content_block_start',
+          index: contentBlockIndex,
+          content_block: { type: 'thinking', thinking: '' },
+        }
+        yield {
+          type: 'content_block_delta',
+          index: contentBlockIndex,
+          delta: { type: 'thinking_delta', thinking: block.thinking as string },
+        }
+        yield { type: 'content_block_stop', index: contentBlockIndex }
+        contentBlockIndex++
+      } else if (block.type === 'tool_use') {
+        const { type: _t, input, ...rest } = block
+        yield {
+          type: 'content_block_start',
+          index: contentBlockIndex,
+          content_block: { type: 'tool_use', input: {}, ...rest },
+        }
+        yield {
+          type: 'content_block_delta',
+          index: contentBlockIndex,
+          delta: { type: 'input_json_delta', partial_json: JSON.stringify(input ?? {}) },
+        }
+        yield { type: 'content_block_stop', index: contentBlockIndex }
+        contentBlockIndex++
+      } else {
+        yield {
+          type: 'content_block_start',
+          index: contentBlockIndex,
+          content_block: { type: 'text', text: '' },
+        }
+        yield {
+          type: 'content_block_delta',
+          index: contentBlockIndex,
+          delta: { type: 'text_delta', text: block.text as string },
+        }
+        yield { type: 'content_block_stop', index: contentBlockIndex }
+        contentBlockIndex++
+      }
+    }
+
+    yield {
+      type: 'message_delta',
+      delta: {
+        stop_reason: message.stop_reason,
+        stop_sequence: null,
+      },
+      usage: message.usage,
+    }
+    yield { type: 'message_stop' }
+    return
+  }
 
   const readerOrNull = response.body?.getReader()
   if (!readerOrNull) throw new Error('Response body is not readable')
@@ -3096,7 +3412,7 @@ class OpenAIShimMessages {
                 ? anthropicSsePassthrough(response, request.resolvedModel, streamSignal)
                 : isGeminiStream
                   ? geminiSseToAnthropic(response, request.resolvedModel, streamSignal)
-                  : openaiStreamToAnthropic(response, request.resolvedModel, streamSignal, isLikelyOllamaEndpoint(request.baseUrl)),
+                  : openaiStreamToAnthropic(response, request.resolvedModel, streamSignal, isLikelyOllamaEndpoint(request.baseUrl), response.url || undefined),
           options?.signal,
           cancelBeforeIteration,
         )
@@ -3406,10 +3722,16 @@ class OpenAIShimMessages {
       isGeminiMode() ||
       hasGeminiApiHost(request.baseUrl) ||
       hasCerebrasApiHost(request.baseUrl) ||
+      hasMistralApiHost(request.baseUrl) ||
       isLocal
 
+    // Mistral's chat completions reject `max_completion_tokens` (and `store`).
+    // When the route resolves to the Mistral descriptor the config already maps
+    // to `max_tokens`; on the host-detected fallback (`hasMistralApiHost`) the
+    // generic default leaves `max_completion_tokens`, so map it here too.
     if (
-      shimConfig.maxTokensField === 'max_tokens' &&
+      (shimConfig.maxTokensField === 'max_tokens' ||
+        hasMistralApiHost(request.baseUrl)) &&
       body.max_completion_tokens !== undefined
     ) {
       body.max_tokens = body.max_completion_tokens
@@ -3553,6 +3875,10 @@ class OpenAIShimMessages {
         if (convertedTools.length > 0) {
           responsesBody.tools = convertedTools
         }
+      }
+
+      for (const field of shimConfig.removeBodyFields ?? []) {
+        delete responsesBody[field]
       }
 
       return responsesBody
@@ -4167,7 +4493,7 @@ class OpenAIShimMessages {
           `OpenAI API error ${status}: ${errorBody}${rateHint}`,
           failureWithUrl,
         ),
-        responseHeaders,
+        headersWithRequestUrl(responseHeaders, requestUrl),
       )
     }
 
@@ -4467,159 +4793,10 @@ class OpenAIShimMessages {
   }
 
   private _convertNonStreamingResponse(
-    data: {
-      id?: string
-      model?: string
-      choices?: Array<{
-        message?: {
-          role?: string
-          content?:
-            | string
-            | null
-            | Array<{ type?: string; text?: string }>
-          reasoning_content?: string | null
-          extra_content?: Record<string, unknown>
-          tool_calls?: Array<{
-            id: string
-            function: { name: string; arguments: string }
-            extra_content?: Record<string, unknown>
-          }>
-        }
-        finish_reason?: string
-      }>
-      usage?: {
-        prompt_tokens?: number
-        completion_tokens?: number
-        prompt_tokens_details?: {
-          cached_tokens?: number
-        }
-      }
-    },
+    data: NonStreamingOpenAIResponse,
     model: string,
   ) {
-    const choice = data.choices?.[0]
-    const content: Array<Record<string, unknown>> = []
-
-    // Recover tool calls that the model emitted as text (no structured
-    // tool_calls field): first the "Tool calls requested:" prefix format, then
-    // XML dialects (GLM/Qwen `<tool_call>…`). Falls back to plain text.
-    const pushParsedTextContent = (strippedContent: string) => {
-      if (choice?.message?.tool_calls) {
-        content.push({ type: 'text', text: strippedContent })
-        return
-      }
-      const rawToolCalls = parseRawToolCallsRequestedText(strippedContent)
-      if (rawToolCalls) {
-        for (const toolCall of rawToolCalls) {
-          content.push({
-            type: 'tool_use',
-            id: toolCall.id,
-            name: toolCall.name,
-            input: JSON.parse(toolCall.argumentsJson),
-          })
-        }
-        return
-      }
-      const { calls, toolCallRanges } = parseXmlToolCalls(strippedContent)
-      if (calls.length > 0) {
-        const remaining = stripRanges(strippedContent, toolCallRanges).trim()
-        if (remaining) content.push({ type: 'text', text: remaining })
-        for (const tc of calls) {
-          content.push({
-            type: 'tool_use',
-            id: tc.id,
-            name: tc.name,
-            input: tc.arguments,
-          })
-        }
-        return
-      }
-      content.push({ type: 'text', text: strippedContent })
-    }
-
-    // Some reasoning models (e.g. GLM-5) put their chain-of-thought in
-    // reasoning_content while content stays null. Preserve it as a thinking
-    // block, but do not surface it as visible assistant text.
-    const reasoningText = choice?.message?.reasoning_content
-    if (typeof reasoningText === 'string' && reasoningText) {
-      content.push({ type: 'thinking', thinking: reasoningText })
-    }
-    const rawContent =
-      choice?.message?.content !== '' && choice?.message?.content != null
-        ? choice?.message?.content
-        : null
-    if (typeof rawContent === 'string' && rawContent) {
-      pushParsedTextContent(stripThinkTags(rawContent))
-    } else if (Array.isArray(rawContent) && rawContent.length > 0) {
-      const parts: string[] = []
-      for (const part of rawContent) {
-        if (
-          part &&
-          typeof part === 'object' &&
-          part.type === 'text' &&
-          typeof part.text === 'string'
-        ) {
-          parts.push(part.text)
-        }
-      }
-      const joined = parts.join('\n')
-      if (joined) {
-        pushParsedTextContent(stripThinkTags(joined))
-      }
-    }
-
-    if (choice?.message?.tool_calls) {
-      for (const tc of choice.message.tool_calls) {
-        const input = normalizeToolArguments(
-          tc.function.name,
-          tc.function.arguments,
-        )
-        const toolExtraContent = tc.extra_content ?? choice.message.extra_content
-        const toolSignature =
-          geminiThoughtSignatureFromExtraContent(tc.extra_content) ??
-          geminiThoughtSignatureFromExtraContent(choice.message.extra_content)
-        const mergedToolExtraContent = mergeGeminiThoughtSignature(
-          toolExtraContent,
-          toolSignature,
-        )
-        content.push({
-          type: 'tool_use',
-          id: tc.id,
-          name: tc.function.name,
-          input,
-          ...(mergedToolExtraContent ? { extra_content: mergedToolExtraContent } : {}),
-          ...(toolSignature ? { signature: toolSignature } : {}),
-        })
-      }
-    }
-
-    const stopReason =
-      choice?.finish_reason === 'tool_calls' ||
-      content.some(block => block.type === 'tool_use')
-        ? 'tool_use'
-        : choice?.finish_reason === 'length'
-          ? 'max_tokens'
-          : 'end_turn'
-
-    if (choice?.finish_reason === 'content_filter' || choice?.finish_reason === 'safety') {
-      content.push({
-        type: 'text',
-        text: '\n\n[Content blocked by provider safety filter]',
-      })
-    }
-
-    return {
-      id: data.id ?? makeMessageId(),
-      type: 'message',
-      role: 'assistant',
-      content,
-      model: data.model ?? model,
-      stop_reason: stopReason,
-      stop_sequence: null,
-      usage: buildAnthropicUsageFromRawUsage(
-        data.usage as unknown as Record<string, unknown> | undefined,
-      ),
-    }
+    return convertNonStreamingResponseToAnthropicMessage(data, model)
   }
 
   private _convertGeminiToAnthropicResponse(

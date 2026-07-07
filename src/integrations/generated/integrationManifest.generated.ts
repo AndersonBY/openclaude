@@ -51,6 +51,20 @@ export const PROVIDER_PRESET_MANIFEST = [
     ]
   },
   {
+    "preset": "aimlapi",
+    "routeKind": "gateway",
+    "routeId": "aimlapi",
+    "vendorId": "openai",
+    "gatewayId": "aimlapi",
+    "description": "AI/ML API OpenAI-compatible endpoint",
+    "apiKeyEnvVars": [
+      "AIMLAPI_API_KEY"
+    ],
+    "modelEnvVars": [
+      "OPENAI_MODEL"
+    ]
+  },
+  {
     "preset": "dashscope-cn",
     "routeKind": "gateway",
     "routeId": "dashscope-cn",
@@ -155,7 +169,7 @@ export const PROVIDER_PRESET_MANIFEST = [
     "routeKind": "vendor",
     "routeId": "gemini",
     "vendorId": "gemini",
-    "description": "Gemini OpenAI-compatible endpoint",
+    "description": "Google AI / Gemini OpenAI-compatible endpoint",
     "apiKeyEnvVars": [
       "GEMINI_API_KEY"
     ]
@@ -454,6 +468,7 @@ export type ProviderPreset = (typeof PROVIDER_PRESET_MANIFEST)[number]['preset']
 export const ORDERED_PROVIDER_PRESETS = [
   "gitlawb-opengateway",
   "anthropic",
+  "aimlapi",
   "dashscope-cn",
   "dashscope-intl",
   "atlas-cloud",

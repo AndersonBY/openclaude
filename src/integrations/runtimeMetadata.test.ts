@@ -82,18 +82,17 @@ describe('resolveModelRuntimeLimits', () => {
     expect(limits.maxOutputTokens).toBe(131_072)
   })
   it('uses the applied provider profile route before generic custom base URL fallback', () => {
-    const limits = resolveModelRuntimeLimits({
-      model: 'kimi-k2.6',
-      activeProfileProvider: 'opencode',
-      processEnv: {
-        CLAUDE_CODE_USE_OPENAI: '1',
-        CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED: '1',
-        OPENAI_BASE_URL: 'https://proxy.example.test/v1',
-      },
-    })
-
-    expect(limits.contextWindow).toBe(262_144)
-    expect(limits.maxOutputTokens).toBe(65_536)
+    expect(
+      resolveModelRuntimeLimits({
+        model: 'kimi-k2.6',
+        activeProfileProvider: 'opencode',
+        processEnv: {
+          CLAUDE_CODE_USE_OPENAI: '1',
+          CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED: '1',
+          OPENAI_BASE_URL: 'https://proxy.example.test/v1',
+        },
+      }),
+    ).toEqual({ contextWindow: 262_144, maxOutputTokens: 65_536 })
   })
 
   it('preserves composite provider paths before generic last-segment fallbacks', () => {
@@ -163,12 +162,12 @@ describe('resolveModelRuntimeLimits', () => {
   })
 })
 
-describe('resolveOpenAIShimRuntimeContext - Z.AI GLM-5.2', () => {
+describe('resolveOpenAIShimRuntimeContext - Z.A.I GLM-5.2', () => {
   it.each([
     'glm-5.2',
     'glm-5.2?reasoning=high',
     'glm-5.2?thinking=disabled',
-  ])('uses Z.AI GLM-5.2 shim settings for %s', model => {
+  ])('uses Z.A.I GLM-5.2 shim settings for %s', model => {
     const result = resolveOpenAIShimRuntimeContext({
       model,
       baseUrl: 'https://api.z.ai/api/coding/paas/v4',
@@ -305,6 +304,88 @@ describe('resolveOpenAIShimRuntimeContext - Moonshot and Kimi Code catalog metad
     expect(result.catalogEntry?.reasoning?.defaultLevel).toBe('medium')
   })
 })
+
+describe('resolveOpenAIShimRuntimeContext - GLM catalog-aware gating', () => {
+  it('does NOT apply the Z.A.I GLM shim to a non-Z.A.I catalog route (NEAR AI)', () => {
+    const result = resolveOpenAIShimRuntimeContext({
+      model: 'zai-org/GLM-5.1-FP8',
+      baseUrl: 'https://cloud-api.near.ai/v1',
+      processEnv: {},
+    })
+
+    expect(result.routeId).toBe('nearai')
+    expect(result.catalogEntry?.id).toBe('zai-org/GLM-5.1-FP8')
+    expect(result.openaiShimConfig.preserveReasoningContent).toBeUndefined()
+    expect(result.openaiShimConfig.thinkingRequestFormat).toBeUndefined()
+    expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBeUndefined()
+    expect(result.openaiShimConfig.removeBodyFields).toBeUndefined()
+  })
+
+  it('applies the full Z.A.I GLM shim to opencode-go GLM via catalog overrides', () => {
+    const result = resolveOpenAIShimRuntimeContext({
+      model: 'glm-5.1',
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+      processEnv: {},
+    })
+
+    expect(result.routeId).toBe('opencode-go')
+    expect(result.catalogEntry?.apiName).toBe('glm-5.1')
+    expect(result.openaiShimConfig.preserveReasoningContent).toBe(true)
+    expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBe(true)
+    expect(result.openaiShimConfig.thinkingRequestFormat).toBe('zai-compatible')
+    expect(result.openaiShimConfig.maxTokensField).toBe('max_tokens')
+    expect(result.openaiShimConfig.removeBodyFields).toEqual(['store'])
+  })
+
+  it('applies the full Z.A.I GLM shim to opencode (Zen) GLM via catalog overrides', () => {
+    const result = resolveOpenAIShimRuntimeContext({
+      model: 'glm-5.1',
+      baseUrl: 'https://opencode.ai/zen/v1',
+      processEnv: {},
+    })
+
+    expect(result.routeId).toBe('opencode')
+    expect(result.catalogEntry?.apiName).toBe('glm-5.1')
+    expect(result.openaiShimConfig.preserveReasoningContent).toBe(true)
+    expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBe(true)
+    expect(result.openaiShimConfig.thinkingRequestFormat).toBe('zai-compatible')
+    expect(result.openaiShimConfig.maxTokensField).toBe('max_tokens')
+    expect(result.openaiShimConfig.removeBodyFields).toEqual(['store'])
+  })
+
+  it('applies the full Z.A.I GLM shim to Atlas Cloud GLM via catalog overrides', () => {
+    const result = resolveOpenAIShimRuntimeContext({
+      model: 'zai-org/glm-5.2',
+      baseUrl: 'https://api.atlascloud.ai/v1',
+      processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+    })
+
+    expect(result.routeId).toBe('atlas-cloud')
+    expect(result.catalogEntry?.id).toBe('zai-org/glm-5.2')
+    expect(result.openaiShimConfig.preserveReasoningContent).toBe(true)
+    expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBe(true)
+    expect(result.openaiShimConfig.thinkingRequestFormat).toBe('zai-compatible')
+    expect(result.openaiShimConfig.maxTokensField).toBe('max_tokens')
+    expect(result.openaiShimConfig.removeBodyFields).toEqual(['store'])
+    expect(result.openaiShimConfig.enableToolStreaming).toBe(true)
+  })
+
+  it('applies the Z.A.I GLM shim to hicap GLM catalog entries', () => {
+    const result = resolveOpenAIShimRuntimeContext({
+      model: 'zai-org/GLM-5.2',
+      baseUrl: 'https://api.hicap.ai/v1',
+      processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+    })
+
+    expect(result.routeId).toBe('hicap')
+    expect(result.catalogEntry?.id).toBe('hicap-glm-5.2')
+    expect(result.openaiShimConfig.thinkingRequestFormat).toBe('zai-compatible')
+    expect(result.openaiShimConfig.maxTokensField).toBe('max_tokens')
+    expect(result.openaiShimConfig.removeBodyFields).toContain('store')
+    expect(result.openaiShimConfig.enableToolStreaming).toBe(true)
+  })
+})
+
 describe('resolveOpenAIShimRuntimeContext - Hicap catalog metadata', () => {
   it('uses Hicap static model limits and per-model shim overrides', () => {
     expect(
@@ -314,6 +395,16 @@ describe('resolveOpenAIShimRuntimeContext - Hicap catalog metadata', () => {
         processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
       }),
     ).toEqual({ contextWindow: 1_000_000, maxOutputTokens: 128_000 })
+
+    for (const model of ['claude-opus-4.7', 'claude-opus-4-7']) {
+      expect(
+        resolveModelRuntimeLimits({
+          model,
+          baseUrl: 'https://api.hicap.ai/v1',
+          processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+        }),
+      ).toEqual({ contextWindow: 1_000_000, maxOutputTokens: 128_000 })
+    }
 
     expect(
       resolveModelRuntimeLimits({
@@ -342,6 +433,18 @@ describe('resolveOpenAIShimRuntimeContext - Hicap catalog metadata', () => {
     expect(glm.openaiShimConfig.maxTokensField).toBe('max_tokens')
     expect(glm.openaiShimConfig.removeBodyFields).toContain('store')
     expect(glm.openaiShimConfig.enableToolStreaming).toBe(true)
+
+    for (const model of ['claude-opus-4.7', 'claude-opus-4-7']) {
+      const opus47 = resolveOpenAIShimRuntimeContext({
+        model,
+        baseUrl: 'https://api.hicap.ai/v1',
+        processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
+      })
+      expect(opus47.catalogEntry?.id).toBe('hicap-claude-opus-4.7')
+      expect(opus47.catalogEntry?.apiName).toBe('claude-opus-4.7')
+      expect(opus47.catalogEntry?.modelDescriptorId).toBe('claude-opus-4-7')
+      expect(opus47.catalogEntry?.reasoning?.levels).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    }
 
     const discoveredGlm = resolveOpenAIShimRuntimeContext({
       model: 'zai-org/GLM-5.2',
@@ -373,7 +476,14 @@ describe('resolveOpenAIShimRuntimeContext - Hicap catalog metadata', () => {
       baseUrl: 'https://api.hicap.ai/v1',
       processEnv: { CLAUDE_CODE_USE_OPENAI: '1' },
     })
+    expect(gpt55.routeId).toBe('hicap')
     expect(gpt55.catalogEntry?.id).toBe('hicap-gpt-5.5')
+    expect(gpt55.catalogEntry?.reasoning?.levels).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ])
     expect(gpt55.openaiShimConfig.requiredApiFormat).toBe('responses')
     expect(gpt55.openaiShimConfig.maxTokensField).toBe('max_completion_tokens')
 
@@ -462,6 +572,20 @@ describe('resolveOpenAIShimRuntimeContext - provider override route preference',
     expect(result.openaiShimConfig.removeBodyFields).toBeUndefined()
     expect(result.openaiShimConfig.thinkingRequestFormat).toBeUndefined()
   })
+
+  it('applies the full Z.AI GLM shim to the direct zai vendor catalog route', () => {
+    const result = resolveOpenAIShimRuntimeContext({
+      model: 'glm-5.2',
+      baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+      processEnv: {},
+    })
+
+    expect(result.routeId).toBe('zai')
+    expect(result.catalogEntry?.id).toBe('glm-5.2')
+    expect(result.openaiShimConfig.preserveReasoningContent).toBe(true)
+    expect(result.openaiShimConfig.thinkingRequestFormat).toBe('zai-compatible')
+    expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBe(true)
+  })
 })
 
 describe('resolveOpenAIShimRuntimeContext - segment-boundary heuristic', () => {
@@ -540,6 +664,62 @@ describe('resolveOpenAIShimRuntimeContext - segment-boundary heuristic', () => {
         model: 'moonshot-v1-8k',
       })
       expect(result.openaiShimConfig.preserveReasoningContent).toBe(true)
+    })
+  })
+
+  describe('GLM models', () => {
+    it('should NOT infer Z.A.I overrides for custom glm aliases', () => {
+      for (const model of ['my-glm-assistant', 'glm-assistant', 'glm-router']) {
+        const result = resolveOpenAIShimRuntimeContext({
+          processEnv: {},
+          model,
+        })
+        expect(result.openaiShimConfig.preserveReasoningContent).toBeUndefined()
+        expect(result.openaiShimConfig.thinkingRequestFormat).toBeUndefined()
+        expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBeUndefined()
+        expect(result.openaiShimConfig.reasoningContentFallback).toBeUndefined()
+        expect(result.openaiShimConfig.maxTokensField).toBeUndefined()
+        expect(result.openaiShimConfig.removeBodyFields).toBeUndefined()
+      }
+    })
+
+    it('should NOT infer Z.A.I overrides for Fireworks GLM catalog entries', () => {
+      const result = resolveOpenAIShimRuntimeContext({
+        processEnv: {},
+        model: 'accounts/fireworks/models/glm-5p2',
+      })
+      expect(result.openaiShimConfig.preserveReasoningContent).toBeUndefined()
+      expect(result.openaiShimConfig.thinkingRequestFormat).toBeUndefined()
+      expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBeUndefined()
+      expect(result.openaiShimConfig.reasoningContentFallback).toBeUndefined()
+      expect(result.openaiShimConfig.maxTokensField).toBeUndefined()
+      expect(result.openaiShimConfig.removeBodyFields).toBeUndefined()
+    })
+
+    it('should infer full GLM config for GLM paths', () => {
+      const result = resolveOpenAIShimRuntimeContext({
+        processEnv: {},
+        model: 'openrouter/zhipu/glm-5.2',
+      })
+      expect(result.openaiShimConfig.preserveReasoningContent).toBe(true)
+      expect(result.openaiShimConfig.thinkingRequestFormat).toBe('zai-compatible')
+      expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBe(true)
+      expect(result.openaiShimConfig.reasoningContentFallback).toBe('')
+      expect(result.openaiShimConfig.maxTokensField).toBe('max_tokens')
+      expect(result.openaiShimConfig.removeBodyFields).toEqual(['store'])
+    })
+
+    it('should infer full GLM config for direct glm model names', () => {
+      const result = resolveOpenAIShimRuntimeContext({
+        processEnv: {},
+        model: 'glm-5.2',
+      })
+      expect(result.openaiShimConfig.preserveReasoningContent).toBe(true)
+      expect(result.openaiShimConfig.thinkingRequestFormat).toBe('zai-compatible')
+      expect(result.openaiShimConfig.requireReasoningContentOnAssistantMessages).toBe(true)
+      expect(result.openaiShimConfig.reasoningContentFallback).toBe('')
+      expect(result.openaiShimConfig.maxTokensField).toBe('max_tokens')
+      expect(result.openaiShimConfig.removeBodyFields).toEqual(['store'])
     })
   })
 

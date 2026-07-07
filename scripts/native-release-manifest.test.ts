@@ -95,11 +95,12 @@ describe('native release workflow', () => {
     }
   })
 
-  test('declares bundled runtime SDK dependencies for clean native builds', async () => {
+  test('keeps optional runtime SDK packages out of default install while source builds can resolve them', async () => {
     const pkg = JSON.parse(
       await readFile(join(import.meta.dir, '..', 'package.json'), 'utf-8'),
     )
     const dependencies = pkg.dependencies ?? {}
+    const devDependencies = pkg.devDependencies ?? {}
 
     for (const dependency of [
       '@aws-sdk/client-bedrock',
@@ -107,8 +108,24 @@ describe('native release workflow', () => {
       '@aws-sdk/client-sts',
       '@aws-sdk/credential-provider-node',
       '@aws-sdk/credential-providers',
+      '@smithy/core',
+      '@smithy/node-http-handler',
+      '@azure/identity',
+      'google-auth-library',
     ]) {
-      expect(dependencies).toHaveProperty(dependency)
+      expect(dependencies).not.toHaveProperty(dependency)
+    }
+
+    for (const dependency of [
+      '@aws-sdk/client-bedrock',
+      '@aws-sdk/client-sts',
+      '@aws-sdk/credential-provider-node',
+      '@smithy/core',
+      '@smithy/node-http-handler',
+      '@azure/identity',
+      'google-auth-library',
+    ]) {
+      expect(devDependencies).toHaveProperty(dependency)
     }
   })
 })

@@ -212,9 +212,11 @@ test('usePreviewTheme() setPreviewTheme changes displayed theme', async () => {
     await waitForFrame(getOutput, f => f.includes('current:dark'))
 
     // setPreviewTheme should change the displayed theme
+    const beforePreviewActions = previewActions
     previewActions!.setPreviewTheme('light')
     const afterPreview = await waitForFrame(getOutput, f => f.includes('current:light'))
     expect(afterPreview).toContain('current:light')
+    await waitForCondition(() => previewActions !== beforePreviewActions)
 
     // cancelPreview should revert to the saved setting
     previewActions!.cancelPreview()

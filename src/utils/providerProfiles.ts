@@ -28,6 +28,7 @@ import {
   buildAtlasCloudProfileEnv,
   buildVertexProfileEnv,
   clearManagedProfileEnv,
+  deleteProfileFile,
   type ProfileFileLocation,
   type ProfileEnv,
   type ProviderProfile as ProviderProfileStartup,
@@ -660,6 +661,9 @@ function isProcessEnvAlignedWithProfile(
         [primaryModel]: profile.maxContextLength,
       })
     : undefined
+  const isAimlapiRoute =
+    profile.provider === 'aimlapi' ||
+    resolveRouteIdFromBaseUrl(profile.baseUrl) === 'aimlapi'
 
   return (
     processEnv.CLAUDE_CODE_USE_OPENAI !== undefined &&
@@ -689,6 +693,10 @@ function isProcessEnvAlignedWithProfile(
       ? !includeApiKey ||
         sameOptionalEnvValue(processEnv.XAI_API_KEY, profile.apiKey)
       : true) &&
+    (isAimlapiRoute
+      ? !includeApiKey ||
+        sameOptionalEnvValue(processEnv.AIMLAPI_API_KEY, profile.apiKey)
+      : true) &&
     (profile.baseUrl?.toLowerCase().includes('api.venice.ai')
       ? !includeApiKey ||
         sameOptionalEnvValue(processEnv.VENICE_API_KEY, profile.apiKey)
@@ -717,6 +725,16 @@ function isProcessEnvAlignedWithProfile(
   )
 }
 
+/**
+ * Sentinel `activeProviderProfileId` meaning "use built-in Anthropic", kept
+ * distinct from `undefined`. Without it, clearing the active id falls through
+ * to `profiles[0]` (see below), so a user with any saved third-party profile
+ * could never return to Anthropic from `/provider` without hand-editing
+ * `~/.openclaude.json` and restarting (#1426). Storing the sentinel preserves
+ * the saved profiles for re-selection while expressing "no third-party active".
+ */
+export const ANTHROPIC_DEFAULT_PROFILE_ID = '__anthropic_default__'
+
 export function getActiveProviderProfile(
   config = getGlobalConfig(),
 ): ProviderProfile | undefined {
@@ -726,7 +744,35 @@ export function getActiveProviderProfile(
   }
 
   const activeId = trimOrUndefined(config.activeProviderProfileId)
+  // Explicit Anthropic selection: do not fall back to the first saved profile.
+  if (activeId === ANTHROPIC_DEFAULT_PROFILE_ID) {
+    return undefined
+  }
   return profiles.find(profile => profile.id === activeId) ?? profiles[0]
+}
+
+/**
+ * Switch back to built-in Anthropic while keeping saved provider profiles.
+ * Clears the managed env this session (so the switch takes effect without a
+ * restart), records the Anthropic sentinel as the active id (so startup no
+ * longer replays a third-party profile), and removes the startup profile
+ * mirror file. Returns false when there was nothing to clear.
+ */
+export function clearActiveProviderProfile(
+  options?: ProfileFileLocation,
+): boolean {
+  const hadActiveProfile = getActiveProviderProfile() !== undefined
+
+  saveGlobalConfig(config => ({
+    ...config,
+    activeProviderProfileId: ANTHROPIC_DEFAULT_PROFILE_ID,
+    openaiAdditionalModelOptionsCache: [],
+  }))
+
+  clearProviderProfileEnvFromProcessEnv()
+  deleteProfileFile(options)
+
+  return hadActiveProfile
 }
 
 export function clearProviderProfileEnvFromProcessEnv(
@@ -817,6 +863,10 @@ export function applyProviderProfileToProcessEnv(
       OPENAI_BASE_URL: normalizedProfileBaseUrl,
       OPENAI_MODEL: primaryModel,
     }
+    const isAimlapiProfile =
+      profile.provider === 'aimlapi' ||
+      route.routeId === 'aimlapi' ||
+      resolveRouteIdFromBaseUrl(profile.baseUrl) === 'aimlapi'
     if (supportsApiFormat && profile.apiFormat) {
       openAIProfileEnv.OPENAI_API_FORMAT = profile.apiFormat
     }
@@ -850,6 +900,9 @@ export function applyProviderProfileToProcessEnv(
       if (route.routeId === 'xai' || isXaiBaseUrl(profile.baseUrl)) {
         openAIProfileEnv.XAI_API_KEY = profile.apiKey
       }
+      if (isAimlapiProfile) {
+        openAIProfileEnv.AIMLAPI_API_KEY = profile.apiKey
+      }
       if (route.routeId === 'venice' || profile.baseUrl.toLowerCase().includes('api.venice.ai')) {
         openAIProfileEnv.VENICE_API_KEY = profile.apiKey
       }
@@ -872,6 +925,14 @@ export function applyProviderProfileToProcessEnv(
       if (route.routeId === 'fireworks' || isFireworksBaseUrl(profile.baseUrl)) {
         openAIProfileEnv.FIREWORKS_API_KEY = profile.apiKey
       }
+    }
+    if (isAimlapiProfile) {
+      const ambientOpenAIKey = trimOrUndefined(process.env.OPENAI_API_KEY)
+      openAIProfileEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID = 'aimlapi'
+      openAIProfileEnv.OPENAI_API_KEY =
+        openAIProfileEnv.OPENAI_API_KEY ?? ambientOpenAIKey
+      openAIProfileEnv.AIMLAPI_API_KEY =
+        openAIProfileEnv.AIMLAPI_API_KEY ?? ambientOpenAIKey
     }
     if (route.gatewayId === 'nvidia-nim') {
       openAIProfileEnv.NVIDIA_NIM = '1'
@@ -907,6 +968,28 @@ export function applyActiveProviderProfileFromConfig(
   },
 ): ProviderProfile | undefined {
   const processEnv = options?.processEnv ?? process.env
+
+  // Built-in Anthropic is an explicit active state recorded as the sentinel,
+  // not "no active profile". getActiveProviderProfile() resolves the sentinel
+  // to undefined, so without this guard we would return below without marking
+  // provider env as handled; buildStartupEnvFromProfile() then treats the
+  // profile mirror that clearActiveProviderProfile() deleted as a fresh install
+  // and synthesizes the default Gitlawb OpenGateway env, bouncing the user off
+  // built-in Anthropic on the next launch (#1429). Clear any managed provider
+  // env and set the applied flag so the legacy/fresh-install fallback is
+  // suppressed. An explicit startup provider selection still wins for the
+  // current session, matching the saved-profile branch below.
+  if (
+    trimOrUndefined(config.activeProviderProfileId) === ANTHROPIC_DEFAULT_PROFILE_ID
+  ) {
+    if (!options?.force && hasCompleteProviderSelection(processEnv)) {
+      return undefined
+    }
+    clearProviderProfileEnvFromProcessEnv(processEnv)
+    processEnv[PROFILE_ENV_APPLIED_FLAG] = '1'
+    return undefined
+  }
+
   const activeProfile = getActiveProviderProfile(config)
   if (!activeProfile) {
     return undefined
@@ -965,10 +1048,28 @@ export function addProviderProfile(
     const currentProfiles = getProviderProfiles(current)
     const nextProfiles = [...currentProfiles, profile]
     const currentActive = trimOrUndefined(current.activeProviderProfileId)
+    // Resolve the *effective* active id the same way getActiveProviderProfile
+    // does, so adding a profile with makeActive:false preserves whatever is
+    // actually active now rather than silently switching the user (#1426):
+    //   - Anthropic sentinel               -> built-in Anthropic (keep sentinel)
+    //   - explicit id for a saved profile  -> that profile
+    //   - stale or unset id with profiles  -> implicit first profile
+    //   - no saved profiles                -> nothing active yet
+    // The stale-id case matters: getActiveProviderProfile() falls back to
+    // profiles[0] for an id whose profile was deleted, so makeActive:false must
+    // keep profiles[0] and not promote the newly added profile.
+    let effectiveActiveId: string | undefined
+    if (currentActive === ANTHROPIC_DEFAULT_PROFILE_ID) {
+      effectiveActiveId = ANTHROPIC_DEFAULT_PROFILE_ID
+    } else if (currentActive && currentProfiles.some(p => p.id === currentActive)) {
+      effectiveActiveId = currentActive
+    } else if (currentProfiles.length > 0) {
+      effectiveActiveId = currentProfiles[0].id
+    } else {
+      effectiveActiveId = undefined
+    }
     const nextActiveId =
-      makeActive || !currentActive || !nextProfiles.some(p => p.id === currentActive)
-        ? profile.id
-        : currentActive
+      makeActive || effectiveActiveId === undefined ? profile.id : effectiveActiveId
 
     return {
       ...current,
@@ -1019,8 +1120,12 @@ export function updateProviderProfile(
     delete cacheByProfile[profileId]
 
     const currentActive = trimOrUndefined(current.activeProviderProfileId)
+    // Updating any profile must not reactivate profiles[0] when the user is on
+    // built-in Anthropic — the sentinel is a valid active state to preserve.
     const nextActiveId =
-      currentActive && nextProfiles.some(profile => profile.id === currentActive)
+      currentActive &&
+      (currentActive === ANTHROPIC_DEFAULT_PROFILE_ID ||
+        nextProfiles.some(profile => profile.id === currentActive))
         ? currentActive
         : nextProfiles[0]?.id
 
@@ -1110,6 +1215,9 @@ function buildOpenAICompatibleStartupEnv(
   if (isCodexBaseUrl(activeProfile.baseUrl)) {
     return null
   }
+  const isAimlapiProfile =
+    activeProfile.provider === 'aimlapi' ||
+    resolveRouteIdFromBaseUrl(activeProfile.baseUrl) === 'aimlapi'
 
   if (activeProfile.apiKey) {
     const strictEnv = buildOpenAIProfileEnv({
@@ -1125,6 +1233,10 @@ function buildOpenAICompatibleStartupEnv(
       processEnv: {},
     })
     if (strictEnv) {
+      if (isAimlapiProfile) {
+        strictEnv.AIMLAPI_API_KEY = activeProfile.apiKey
+        strictEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID = 'aimlapi'
+      }
       // Atlas Cloud is dedicatedCredentialsOnly: its route ignores
       // OPENAI_API_KEY, so a generic OpenAI profile pointed at Atlas must
       // persist the dedicated key too or it relaunches unauthenticated.
@@ -1160,38 +1272,44 @@ function buildOpenAICompatibleStartupEnv(
       : {}),
   }
 
-    if (activeProfile.apiKey) {
-      env.OPENAI_API_KEY = activeProfile.apiKey
-      if (activeProfile.baseUrl?.toLowerCase().includes('bankr')) {
-        env.BNKR_API_KEY = activeProfile.apiKey
-      }
-      if (isXaiBaseUrl(activeProfile.baseUrl)) {
-        env.XAI_API_KEY = activeProfile.apiKey
-      }
-      if (activeProfile.baseUrl?.toLowerCase().includes('api.venice.ai')) {
-        env.VENICE_API_KEY = activeProfile.apiKey
-      }
-      if (
-        activeProfile.baseUrl?.toLowerCase().includes('api.xiaomimimo.com') ||
-        activeProfile.baseUrl?.toLowerCase().includes('api.mimo-v2.com')
-      ) {
-        env.MIMO_API_KEY = activeProfile.apiKey
-      }
-      if (activeProfile.baseUrl?.toLowerCase().includes('atlascloud')) {
-        env.ATLAS_CLOUD_API_KEY = activeProfile.apiKey
-      }
-      if (isClinePassProfile(activeProfile)) {
-        env.CLINE_API_KEY = activeProfile.apiKey
-      }
-      if (isNearaiBaseUrl(activeProfile.baseUrl)) {
-        env.NEARAI_API_KEY = activeProfile.apiKey
-      }
-      if (isFireworksBaseUrl(activeProfile.baseUrl)) {
-        env.FIREWORKS_API_KEY = activeProfile.apiKey
-      }
-    } else {
-      delete env.OPENAI_API_KEY
+  if (isAimlapiProfile) {
+    env.CLAUDE_CODE_PROVIDER_ROUTE_ID = 'aimlapi'
+  }
+  if (activeProfile.apiKey) {
+    env.OPENAI_API_KEY = activeProfile.apiKey
+    if (activeProfile.baseUrl?.toLowerCase().includes('bankr')) {
+      env.BNKR_API_KEY = activeProfile.apiKey
     }
+    if (isXaiBaseUrl(activeProfile.baseUrl)) {
+      env.XAI_API_KEY = activeProfile.apiKey
+    }
+    if (isAimlapiProfile) {
+      env.AIMLAPI_API_KEY = activeProfile.apiKey
+    }
+    if (activeProfile.baseUrl?.toLowerCase().includes('api.venice.ai')) {
+      env.VENICE_API_KEY = activeProfile.apiKey
+    }
+    if (
+      activeProfile.baseUrl?.toLowerCase().includes('api.xiaomimimo.com') ||
+      activeProfile.baseUrl?.toLowerCase().includes('api.mimo-v2.com')
+    ) {
+      env.MIMO_API_KEY = activeProfile.apiKey
+    }
+    if (activeProfile.baseUrl?.toLowerCase().includes('atlascloud')) {
+      env.ATLAS_CLOUD_API_KEY = activeProfile.apiKey
+    }
+    if (isClinePassProfile(activeProfile)) {
+      env.CLINE_API_KEY = activeProfile.apiKey
+    }
+    if (isNearaiBaseUrl(activeProfile.baseUrl)) {
+      env.NEARAI_API_KEY = activeProfile.apiKey
+    }
+    if (isFireworksBaseUrl(activeProfile.baseUrl)) {
+      env.FIREWORKS_API_KEY = activeProfile.apiKey
+    }
+  } else {
+    delete env.OPENAI_API_KEY
+  }
   return applySupportedProfileCustomHeaders(activeProfile, env)
 }
 
@@ -1464,13 +1582,18 @@ export function deleteProviderProfile(profileId: string): {
 
     const nextProfiles = currentProfiles.filter(profile => profile.id !== profileId)
     const currentActive = trimOrUndefined(current.activeProviderProfileId)
+    // The Anthropic sentinel survives deletion of any other profile — deleting
+    // an inactive saved profile must not knock a built-in-Anthropic user back
+    // onto profiles[0] (#1426).
     const activeWasDeleted =
-      !currentActive || currentActive === profileId ||
-      !nextProfiles.some(profile => profile.id === currentActive)
+      !currentActive ||
+      currentActive === profileId ||
+      (currentActive !== ANTHROPIC_DEFAULT_PROFILE_ID &&
+        !nextProfiles.some(profile => profile.id === currentActive))
 
     const nextActiveId = activeWasDeleted ? nextProfiles[0]?.id : currentActive
 
-    if (nextActiveId) {
+    if (nextActiveId && nextActiveId !== ANTHROPIC_DEFAULT_PROFILE_ID) {
       nextActiveProfile =
         nextProfiles.find(profile => profile.id === nextActiveId) ?? nextProfiles[0]
     }

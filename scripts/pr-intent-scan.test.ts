@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -26,6 +33,42 @@ function git(cwd: string, args: string[]): string {
     )
   }
   return result.stdout.trim()
+}
+
+function sleepSync(ms: number): void {
+  const shared = new SharedArrayBuffer(4)
+  const view = new Int32Array(shared)
+  Atomics.wait(view, 0, 0, ms)
+}
+
+function rmDirWithRetry(path: string): void {
+  const maxAttempts = 8
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      rmSync(path, { recursive: true, force: true })
+      if (!existsSync(path)) return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'EBUSY' && code !== 'EPERM') {
+        throw error
+      }
+    }
+
+    sleepSync(25 * (attempt + 1))
+  }
+
+  const stalePath = `${path}.stale-${Date.now()}`
+  try {
+    renameSync(path, stalePath)
+  } catch {
+    if (existsSync(path)) {
+      process.once('exit', () => {
+        try {
+          rmSync(path, { recursive: true, force: true })
+        } catch {}
+      })
+    }
+  }
 }
 
 describe('scanAddedLines', () => {
@@ -192,7 +235,7 @@ describe('getGitDiff', () => {
       expect(diff).not.toContain('src/skills/mcpSkills.test.ts')
     } finally {
       process.chdir(originalCwd)
-      rmSync(repo, { recursive: true, force: true })
+      rmDirWithRetry(repo)
     }
   })
 })

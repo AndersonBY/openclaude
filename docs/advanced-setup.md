@@ -98,10 +98,22 @@ third-party gateways.
 
 Authentication uses Google Application Default Credentials through
 `google-auth-library`. There is no `OPENAI_API_KEY`-style API key for this
-route. Authenticate with either a service-account file or local ADC:
+route. **For global npm installs, install the auth package on demand** (it is
+not bundled by default — see [Optional provider packages](#optional-provider-packages)):
 
 ```bash
+npm i -g google-auth-library
+```
+
+Authenticate with either local Application Default Credentials (ADC) or a
+service-account key file:
+
+```bash
+# Option 1 — local ADC (interactive, uses your own Google account):
 gcloud auth application-default login
+
+# Option 2 — service-account key file (headless / CI):
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 ```
 
 Minimal setup:
@@ -366,6 +378,24 @@ export OPENAI_MODEL=accounts/fireworks/models/llama-v3p1-70b-instruct
 
 The **OpenClaude VS Code extension** can store the key in Secret Storage and set these variables for you when you launch from the Control Center. See `vscode-extension/openclaude-vscode/README.md`.
 
+## Optional provider packages
+
+To keep the default `npm i -g @makerbi/openclaude` install small and
+warning-free, a few provider SDKs and the native image library are **not
+bundled**. They are loaded on demand, and the CLI prints an `npm install <pkg>`
+hint (add `-g` for the global CLI) if you enable a feature whose package is
+missing. Install only what you need:
+
+| Feature | Trigger | Install |
+| --- | --- | --- |
+| AWS Bedrock | `CLAUDE_CODE_USE_BEDROCK=1` | `npm i -g @anthropic-ai/bedrock-sdk`. Profile-based auth (`~/.aws/credentials`) additionally needs `@aws-sdk/credential-providers` and `@aws-sdk/client-sts`; model listing needs `@aws-sdk/client-bedrock`. Proxy and skip-auth setups may also need `@aws-sdk/credential-provider-node`, `@smithy/node-http-handler`, or `@smithy/core`. The CLI prints the exact missing package if you hit one. |
+| Azure Foundry | `CLAUDE_CODE_USE_FOUNDRY=1` | `npm i -g @anthropic-ai/foundry-sdk @azure/identity` |
+| Claude on Vertex AI / Gemini ADC | `CLAUDE_CODE_USE_VERTEX=1` / Gemini ADC auth | `npm i -g google-auth-library` |
+| Reading/processing images | reading an image file | `npm i -g sharp` |
+
+When installing OpenClaude from source (`bun install`), all of these are
+already present as dev dependencies, so source/dev builds need no extra steps.
+
 ## Environment Variables
 
 | Variable | Required | Description |
@@ -394,6 +424,7 @@ The **OpenClaude VS Code extension** can store the key in Secret Storage and set
 | `CODEX_HOME` | Codex only | Alternative Codex home directory |
 | `OPENCLAUDE_MAX_RETRIES` | No | Maximum retry attempts for retryable API failures, capped at 100 (default: 10). Set to `0` to disable retries after the initial request. If unset, deprecated `CLAUDE_CODE_MAX_RETRIES` is still honored for compatibility. |
 | `OPENCLAUDE_RETRY_DELAY_MS` | No | Base retry delay in milliseconds for APIs that do not send `Retry-After`; exponential backoff starts from this value, capped at 60000 (default: 500) |
+| `OPENCLAUDE_QUERY_HARD_MAX_MS` | No | Foreground query hard maximum in milliseconds. Defaults to 1800000 (30 minutes). Use a larger positive integer for long autonomous sessions; invalid, zero, negative, fractional, or timer-overflow values are ignored with a warning. |
 | `OPENCLAUDE_DISABLE_CO_AUTHORED_BY` | No | Suppress the default `Co-Authored-By` trailer in generated git commits |
 | `OPENCLAUDE_LOG_TOKEN_USAGE` | No | When truthy (e.g. `verbose`), emits one JSON line on stderr per API request with input/output/cache tokens and the resolved provider. **User-facing debug output** — complements the REPL display controlled by `/config showCacheStats`. Distinct from `CLAUDE_CODE_ENABLE_TOKEN_USAGE_ATTACHMENT`, which is **model-facing** (injects context usage info into the prompt itself). Both can run together. |
 
@@ -526,6 +557,18 @@ Supported values:
   profile-only custom model IDs.
 - `profile`: show only explicitly configured profile models.
 
+When the provider-profile env workflow is active (i.e. a profile has been
+applied and `CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED=1` is set — as it is after
+launching with a saved profile) and you have more than one saved provider
+profile, `/model` also lists models from your **inactive** profiles, grouped
+under their profile name. Selecting one activates that provider profile and
+switches to the chosen model in a single step, reconciling fast mode if the
+target provider cannot run it. These cross-profile entries appear only in the
+interactive `/model` picker — they are never returned to SDK/automation callers
+and are hidden from inline pickers (such as the prompt hotkey or Settings),
+which cannot switch the active profile. Simply having multiple profiles
+configured without the env workflow active does not surface them.
+
 Use `--provider ollama` when you want a local-only path. Auto mode falls back to OpenAI when no viable local chat model is installed.
 
 Use `--provider atomic-chat` when you want Atomic Chat as the local Apple Silicon provider.
@@ -541,9 +584,14 @@ For `dev:atomic-chat`, make sure Atomic Chat is running with a model loaded befo
 
 ## Message-Count Compaction Threshold
 
-By default, OpenClaude compacts conversations based on token usage. A secondary
-message-count-based trigger (`OPENCLAUDE_MAX_ACTIVE_MESSAGES`) exists for
-diagnostics but is disabled by default.
+By default, OpenClaude compacts conversations based on token usage and also
+applies a safety hard cap of 1000 active messages. The hard cap catches long
+sessions that accumulate many small messages with negligible token cost.
+
+This hard cap is a safety net: it can still trigger compaction even when
+`DISABLE_COMPACT`, `DISABLE_AUTO_COMPACT`, or a disabled auto-compact setting
+would otherwise prevent it. Set `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP=0`
+only when you need to suppress that safety cap for diagnostics.
 
 If you frequently resume long sessions that accumulate hundreds of small
 tool-result messages with negligible token cost, you can opt in to message-count
@@ -554,10 +602,26 @@ compaction via the in-app `/config` command:
 ```
 
 Select **Message-count compaction** and choose a threshold (`100`, `200`, `500`,
-or `1000`). Setting it to `off` (default) disables the message-count trigger.
+or `1000`). Setting it to `off` (default) leaves only the built-in hard cap.
 
 This setting is intended for power users debugging specific edge cases. Most
 users should leave it at `off`.
 
 The legacy `OPENCLAUDE_MAX_ACTIVE_MESSAGES` environment variable is still
-honored when the setting is `off`.
+honored when the setting is `off`. `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP`
+can override the safety cap; set it to `0` only for diagnostics.
+
+### Long-session memory guard validation
+
+For changes that touch auto-compact, provider request conversion, transcript
+retention, or in-process teammates, run the focused long-session guard checks:
+
+```bash
+bun test --feature=UNATTENDED_RETRY src/query/autoCompactCooldown.test.ts src/utils/maxActiveMessages.test.ts src/services/api/openaiShim.test.ts
+```
+
+These tests cover repeated over-cap turns, auto-compact cooldown blocking,
+teammate active-message compaction, malformed hard-cap overrides, and
+pruned-history tool-call/tool-result pairing. They are not a substitute for a
+multi-hour manual soak, but they pin the bounded-history and conversion
+invariants that previously let long sessions grow until Node/V8 OOM.

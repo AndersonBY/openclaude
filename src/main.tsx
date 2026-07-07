@@ -1458,7 +1458,7 @@ async function run(): Promise<CommanderCommand> {
         }
         if (reservedNameError) {
           // stderr+exit(1) — a throw here becomes a silent unhandled
-          // rejection in stream-json mode (void main() in cli.tsx).
+          // rejection in stream-json mode (await main() in cli.tsx).
           process.stderr.write(`Error: ${reservedNameError}\n`);
           process.exit(1);
         }
@@ -4155,6 +4155,37 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/agents.js');
     await agentsHandler();
     process.exit(0);
+  });
+
+  const runSkillsCommanderAction = async (action: (handlers: typeof import('./cli/handlers/skills.js')) => Promise<void>) => {
+    const [skillsHandlers, {
+      runSkillsCliAction
+    }] = await Promise.all([import('./cli/handlers/skills.js'), import('./cli/handlers/skillsCli.js')]);
+    await runSkillsCliAction(() => action(skillsHandlers));
+    process.exit(process.exitCode ?? 0);
+  };
+  const skillsCmd = program.command('skills').description('List, inspect, validate, and manage OpenClaude skills').configureHelp(createSortedHelpConfig());
+  skillsCmd.command('list').description('List configured skills').option('--json', 'Output as JSON').action(async (options: {
+    json?: boolean;
+  }) => runSkillsCommanderAction(({ skillsListHandler }) => skillsListHandler(options)));
+  skillsCmd.command('show <name>').description('Show details for a configured skill').action(async (name: string) => {
+    await runSkillsCommanderAction(({ skillsShowHandler }) => skillsShowHandler(name));
+  });
+  skillsCmd.command('validate <path>').description('Validate a local skill directory').action(async (path: string) => {
+    await runSkillsCommanderAction(({ skillsValidateHandler }) => skillsValidateHandler(path));
+  });
+  skillsCmd.command('install <idOrUrlOrPath>').description('Install a skill from the registry, URL, or local path').option('--registry <urlOrPath>', 'Registry JSON URL/path for registry ID installs').option('--sha256 <hash>', 'Expected SHA-256 digest for direct HTTP(S) URL installs').option('--global', 'Install to the user-global skills directory').option('--force', 'Overwrite an existing installed skill').action(async (idOrUrlOrPath: string, options: {
+    registry?: string;
+    sha256?: string;
+    global?: boolean;
+    force?: boolean;
+  }) => {
+    await runSkillsCommanderAction(({ skillsInstallHandler }) => skillsInstallHandler(idOrUrlOrPath, options));
+  });
+  skillsCmd.command('remove <name>').description('Remove a local project skill').option('--global', 'Remove from the user-global skills directory').action(async (name: string, options: {
+    global?: boolean;
+  }) => {
+    await runSkillsCommanderAction(({ skillsRemoveHandler }) => skillsRemoveHandler(name, options));
   });
   if (feature('TRANSCRIPT_CLASSIFIER')) {
     // Skip when tengu_auto_mode_config.enabled === 'disabled' (circuit breaker).

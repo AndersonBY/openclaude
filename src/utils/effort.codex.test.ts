@@ -541,10 +541,10 @@ test('Atlas Cloud catalog exposes only verified reasoning controls for exact mod
     supportsReasoning: true,
     controllable: true,
     source: 'metadata',
-    levels: ['low', 'medium', 'high', 'xhigh'],
-    wireFormat: 'reasoning_effort',
+    levels: ['high', 'xhigh'],
+    wireFormat: 'zai_compatible',
   })
-  expect(getAvailableEffortLevels('glm-5.2')).toEqual(['low', 'medium', 'high', 'xhigh'])
+  expect(getAvailableEffortLevels('glm-5.2')).toEqual(['high', 'xhigh'])
   expect(resolveAppliedEffort('glm-5.2', 'xhigh')).toBe('xhigh')
 
   const verifiedAtlasReasoningModels = [
@@ -561,13 +561,6 @@ test('Atlas Cloud catalog exposes only verified reasoning controls for exact mod
     'openai/gpt-5.4',
     'google/gemini-3.5-flash',
     'google/gemini-3.1-pro-preview',
-    'zai-org/glm-5.2',
-    'zai-org/glm-5.1',
-    'zai-org/glm-5',
-    'zai-org/glm-5-turbo',
-    'zai-org/glm-5v-turbo',
-    'zai-org/glm-4.7',
-    'zai-org/GLM-4.6',
     'minimaxai/minimax-m3',
     'minimaxai/minimax-m2.7',
     'minimaxai/minimax-m2.5',
@@ -591,6 +584,28 @@ test('Atlas Cloud catalog exposes only verified reasoning controls for exact mod
       wireFormat: 'reasoning_effort',
     })
     expect(getAvailableEffortLevels(model)).toEqual(['low', 'medium', 'high', 'xhigh'])
+    expect(resolveAppliedEffort(model, 'xhigh')).toBe('xhigh')
+    expect(resolveAppliedEffort(model, 'max')).toBe('high')
+  }
+
+  const verifiedAtlasZaiGlmModels = [
+    'zai-org/glm-5.2',
+    'zai-org/glm-5.1',
+    'zai-org/glm-5',
+    'zai-org/glm-5-turbo',
+    'zai-org/glm-5v-turbo',
+    'zai-org/glm-4.7',
+    'zai-org/GLM-4.6',
+  ]
+  for (const model of verifiedAtlasZaiGlmModels) {
+    expect(resolveModelReasoningControl(model)).toMatchObject({
+      supportsReasoning: true,
+      controllable: true,
+      source: 'metadata',
+      levels: ['high', 'xhigh'],
+      wireFormat: 'zai_compatible',
+    })
+    expect(getAvailableEffortLevels(model)).toEqual(['high', 'xhigh'])
     expect(resolveAppliedEffort(model, 'xhigh')).toBe('xhigh')
     expect(resolveAppliedEffort(model, 'max')).toBe('high')
   }

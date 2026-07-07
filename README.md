@@ -139,13 +139,28 @@ or network service, and permission/provider/model/settings flags are passed to
 the child process the same way they are for a foreground `--print` run. Session
 metadata and logs are stored under the resolved OpenClaude config directory,
 usually `~/.openclaude/bg-sessions/`; `OPENCLAUDE_CONFIG_DIR` can point
-OpenClaude somewhere else, with `CLAUDE_CONFIG_DIR` still supported as the
-legacy fallback. Session names can be reused after older sessions reach a
-terminal state; use the session ID to inspect older logs with the same name.
+OpenClaude somewhere else. `CLAUDE_CONFIG_DIR` is ignored for OpenClaude
+background-session storage. Session names can be reused after older sessions
+reach a terminal state; use the session ID to inspect older logs with the same
+name.
 
 `openclaude attach <id-or-name>` currently reports the matching session and
 points to `openclaude logs <id> -f`; full terminal reattach is not implemented
 for local background sessions yet.
+
+### OpenClaude config cutover
+
+OpenClaude stores its own config under `~/.openclaude` and `~/.openclaude.json`
+by default. It does not read `~/.claude`, project `.claude/` directories, or
+`CLAUDE_CONFIG_DIR`; new users can start with an empty OpenClaude config and do
+not need Claude Code installed.
+
+If you previously used OpenClaude with `.claude` paths, migrate intentionally:
+copy only the settings, commands, agents, skills, scheduled tasks, or other files
+you personally created for OpenClaude into the matching `.openclaude` location.
+Do not blanket-copy `.claude`, and do not copy Claude Code credentials or auth
+files. For provider authentication, prefer running OpenClaude's provider setup
+again or exporting provider-specific environment variables.
 
 ### Fastest OpenAI setup
 
@@ -209,6 +224,7 @@ Beginner-friendly guides:
 Advanced and source-build guides:
 
 - [Advanced Setup](docs/advanced-setup.md)
+- [Smart Auto-Routing](docs/smart-routing.md)
 - [Android Install](ANDROID_INSTALL.md)
 
 ## Supported Providers
@@ -217,6 +233,7 @@ Advanced and source-build guides:
 | --- | --- | --- |
 | OpenAI-compatible | `/provider` or env vars | Works with OpenAI, OpenRouter, DeepSeek, Groq, Mistral, LM Studio, and other compatible `/v1` servers |
 | Z.AI GLM Coding Plan | `/provider` or OpenAI-compatible env vars | Uses `OPENAI_API_KEY` at `https://api.z.ai/api/coding/paas/v4` and defaults to `glm-5.2` |
+| AI/ML API | `/provider` or `AIMLAPI_API_KEY` ([setup guide](docs/aimlapi-setup.md)) | Uses `https://api.aimlapi.com/v1`, auto-detects the OpenAI-compatible route from `AIMLAPI_API_KEY`, sends OpenClaude attribution headers, and discovers chat-capable models from the public `/models` catalog |
 | Hicap | `/provider` or OpenAI-compatible env vars | Uses `api-key` auth, discovers models from unauthenticated `/models`, and supports Responses mode for `gpt-` models |
 | Fireworks AI | `/provider` or env vars | First-class provider with 276 curated models (DeepSeek, Qwen, Llama, Gemma, and more); uses `FIREWORKS_API_KEY` |
 | ClinePass | `/provider` or env vars | AI model gateway with usage limits (5hr, weekly, monthly); uses `CLINE_API_KEY` at `https://api.cline.bot/api/v1` |
@@ -241,6 +258,7 @@ Advanced and source-build guides:
 - **Images**: URL and base64 image inputs for providers that support vision
 - **Provider profiles**: Guided setup plus saved user-level provider profile support
 - **Local and remote model backends**: Cloud APIs, local servers, and Apple Silicon local inference
+- **Codebase intelligence (repo map)**: Structural map of the repository ranked by PageRank importance, auto-injected into context when the `REPO_MAP` flag is enabled or the `REPO_MAP` environment variable is set. Inspect with `/repomap` (2048-token default). See [docs/repo-map.md](docs/repo-map.md) for details.
 
 ## Provider Notes
 
@@ -250,6 +268,7 @@ OpenClaude supports multiple providers, but behavior is not identical across all
 - Tool quality depends heavily on the selected model
 - Smaller local models can struggle with long multi-step tool flows
 - Some providers impose lower output caps than the CLI defaults, and OpenClaude adapts where possible
+- AI/ML API uses the OpenAI-compatible route, defaults to `gpt-4o`, and only surfaces chat-capable models from its public catalog
 - Gitlawb Opengateway is the fresh-install startup default and requires an API key from https://gitlawb.com/opengateway/keys. It uses one OpenAI-compatible base URL; switch between `mimo-*` and `google/gemini-3.1-flash-lite-preview` with `/model`, and do not pin the base URL to `/v1/xiaomi-mimo`.
 - Z.AI GLM Coding Plan uses `https://api.z.ai/api/coding/paas/v4` with `glm-5.2` by default. Use `glm-5.2?reasoning=high` for enhanced reasoning, `glm-5.2?reasoning=xhigh` to request Z.AI `reasoning_effort=max`, or `glm-5.2?thinking=disabled` for faster direct answers.
 - Xiaomi MiMo uses `api-key` header auth on the direct OpenAI-compatible route and currently does not support `/usage` reporting in OpenClaude

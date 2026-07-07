@@ -274,6 +274,85 @@ test('openai launch prefers a live dedicated vendor key over the persisted one',
   assert.equal(env.ATLAS_CLOUD_API_KEY, 'atlas-rotated-key')
 })
 
+test('openai launch carries AIMLAPI_API_KEY only when the route resolves to aimlapi', async () => {
+  // Ambient/persisted AIMLAPI_API_KEY must not leak into an unrelated OpenAI
+  // route — AI/ML API authenticates via OPENAI_API_KEY there.
+  const offRoute = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'https://api.openai.com/v1',
+      OPENAI_API_KEY: 'sk-openai',
+      AIMLAPI_API_KEY: 'aimlapi-persisted',
+    }),
+    goal: 'coding',
+    processEnv: {
+      AIMLAPI_API_KEY: 'aimlapi-ambient',
+    },
+  })
+
+  assert.equal(offRoute.AIMLAPI_API_KEY, undefined)
+
+  // On the aimlapi route the dedicated key is carried like other providers.
+  const onRoute = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'https://api.aimlapi.com/v1',
+      OPENAI_MODEL: 'gpt-4o',
+      OPENAI_API_KEY: 'aimlapi-key',
+      AIMLAPI_API_KEY: 'aimlapi-key',
+    }),
+    goal: 'coding',
+    processEnv: {},
+  })
+
+  assert.equal(onRoute.AIMLAPI_API_KEY, 'aimlapi-key')
+})
+
+test('openai launch mirrors rotated OPENAI_API_KEY into AIMLAPI_API_KEY on aimlapi route', async () => {
+  const env = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'https://api.aimlapi.com/v1',
+      OPENAI_MODEL: 'gpt-4o',
+      OPENAI_API_KEY: 'old-openai-key',
+      AIMLAPI_API_KEY: 'old-aimlapi-key',
+    }),
+    goal: 'coding',
+    processEnv: {
+      OPENAI_API_KEY: 'rotated-openai-key',
+    },
+  })
+
+  assert.equal(env.OPENAI_API_KEY, 'rotated-openai-key')
+  assert.equal(env.AIMLAPI_API_KEY, 'rotated-openai-key')
+})
+
+test('openai launch lets live base URL override persisted AIMLAPI route marker', async () => {
+  const env = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      CLAUDE_CODE_PROVIDER_ROUTE_ID: 'aimlapi',
+      OPENAI_BASE_URL: 'https://proxy.example.com/v1',
+      OPENAI_MODEL: 'gpt-4o',
+      OPENAI_API_KEY: 'persisted-aimlapi-key',
+      AIMLAPI_API_KEY: 'persisted-aimlapi-key',
+    }),
+    goal: 'coding',
+    processEnv: {
+      OPENAI_BASE_URL: 'https://api.openai.com/v1',
+      OPENAI_API_KEY: 'live-openai-key',
+      AIMLAPI_API_KEY: 'ambient-aimlapi-key',
+    },
+  })
+
+  assert.equal(env.OPENAI_BASE_URL, 'https://api.openai.com/v1')
+  assert.equal(env.OPENAI_API_KEY, 'live-openai-key')
+  assert.equal(env.AIMLAPI_API_KEY, undefined)
+  // The stale aimlapi route marker must be cleared entirely, not just
+  // swapped to a different route value.
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, undefined)
+})
+
 test('xai launch uses descriptor defaults and persisted xAI key', async () => {
   const env = await buildLaunchEnv({
     profile: 'xai',
@@ -917,7 +996,7 @@ test('saveProfileFile writes a profile that loadProfileFile can read back', () =
   }
 })
 
-test('saveProfileFile defaults to user config instead of the working directory', () => {
+test('saveProfileFile defaults to user config instead of the working directory', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-workspace-profile-'))
   const configRoot = mkdtempSync(join(tmpdir(), 'openclaude-config-profile-'))
   const configDir = join(configRoot, 'config')
@@ -956,7 +1035,7 @@ test('saveProfileFile defaults to user config instead of the working directory',
   }
 })
 
-test('loadProfileFile keeps project-local files as a legacy fallback', () => {
+test('loadProfileFile keeps project-local files as a legacy fallback', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-legacy-profile-'))
   const configDir = mkdtempSync(join(tmpdir(), 'openclaude-empty-config-profile-'))
   const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
@@ -989,7 +1068,7 @@ test('loadProfileFile keeps project-local files as a legacy fallback', () => {
   }
 })
 
-test('loadProfileFile does not fall back when user config profile is invalid', () => {
+test('loadProfileFile does not fall back when user config profile is invalid', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-invalid-profile-'))
   const configDir = mkdtempSync(join(tmpdir(), 'openclaude-invalid-config-profile-'))
   const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
@@ -1023,7 +1102,7 @@ test('loadProfileFile does not fall back when user config profile is invalid', (
   }
 })
 
-test('deleteProfileFile clears the default profile and legacy workspace fallback', () => {
+test('deleteProfileFile clears the default profile and legacy workspace fallback', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-delete-profile-'))
   const configDir = mkdtempSync(join(tmpdir(), 'openclaude-delete-config-profile-'))
   const previousConfigDir = process.env.CLAUDE_CONFIG_DIR

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { beforeEach, describe, expect, mock, test } from 'bun:test'
 
 import type { Message } from '../../types/message.js'
 import { createAssistantMessage, createUserMessage } from '../../utils/messages.js'
@@ -8,8 +8,15 @@ import { createAssistantMessage, createUserMessage } from '../../utils/messages.
 // verify the core predicate: MCP tools (prefixed 'mcp__') should be
 // compactable alongside the built-in tool set.
 
-// Import internals we can test
-import { evaluateTimeBasedTrigger } from './microCompact.js'
+type MicroCompactModule = typeof import('./microCompact.js')
+
+beforeEach(() => {
+  mock.restore()
+})
+
+async function importMicroCompact(): Promise<MicroCompactModule> {
+  return import(`./microCompact.js?microCompactTest=${Date.now()}-${Math.random()}`)
+}
 
 /**
  * Helper: build a minimal assistant message with a tool_use block.
@@ -60,14 +67,14 @@ describe('microCompact MCP tool compaction', () => {
   // built-in and MCP tools are treated consistently.
 
   test('module exports load correctly', async () => {
-    const mod = await import('./microCompact.js')
+    const mod = await importMicroCompact()
     expect(mod.microcompactMessages).toBeFunction()
     expect(mod.estimateMessageTokens).toBeFunction()
     expect(mod.evaluateTimeBasedTrigger).toBeFunction()
   })
 
   test('estimateMessageTokens counts MCP tool_use blocks', async () => {
-    const { estimateMessageTokens } = await import('./microCompact.js')
+    const { estimateMessageTokens } = await importMicroCompact()
 
     const builtinMessages: Message[] = [
       assistantWithToolUse('Read', 'tool-builtin-1'),
@@ -92,7 +99,7 @@ describe('microCompact MCP tool compaction', () => {
   })
 
   test('microcompactMessages processes MCP tools without error', async () => {
-    const { microcompactMessages } = await import('./microCompact.js')
+    const { microcompactMessages } = await importMicroCompact()
 
     const messages: Message[] = [
       assistantWithToolUse('mcp__slack__send_message', 'tool-mcp-2'),
@@ -109,7 +116,7 @@ describe('microCompact MCP tool compaction', () => {
   })
 
   test('microcompactMessages processes mixed built-in and MCP tools', async () => {
-    const { microcompactMessages } = await import('./microCompact.js')
+    const { microcompactMessages } = await importMicroCompact()
 
     const messages: Message[] = [
       assistantWithToolUse('Read', 'tool-read-1'),
@@ -127,7 +134,7 @@ describe('microCompact MCP tool compaction', () => {
 
   test('time-based microcompact clears native toolUseResult for old compacted results', async () => {
     const { maybeTimeBasedMicrocompact, TIME_BASED_MC_CLEARED_MESSAGE } =
-      await import('./microCompact.js')
+      await importMicroCompact()
     const oldAssistant = {
       ...assistantWithToolUse('Read', 'tool-read-old'),
       timestamp: new Date(Date.now() - 120 * 60_000).toISOString(),
@@ -173,5 +180,67 @@ describe('microCompact MCP tool compaction', () => {
     expect(keptRecent.toolUseResult).toEqual({
       content: 'recent file content',
     })
+  })
+})
+
+describe('estimateMessageTokens coverage', () => {
+  test('counts tokens from string content user messages', async () => {
+    const { estimateMessageTokens } = await importMicroCompact()
+
+    // Real user messages from the session can have string content (plain user prompt)
+    const content =
+      'Hello world this is a long user prompt that needs compression because it is over the threshold'
+    const messages: Message[] = [createUserMessage({ content })]
+
+    const total = estimateMessageTokens(messages)
+    // The string-content user message should be counted on its own; the old
+    // implementation returned 0 because it skipped non-array content.
+    expect(total).toBeGreaterThan(0)
+  })
+
+  test('counts tokens across all block types including tool_result and tool_use', async () => {
+    const { estimateMessageTokens } = await importMicroCompact()
+
+    const msg = createUserMessage({
+      content: [
+        { type: 'tool_result' as const, tool_use_id: 't1', content: 'A'.repeat(5000) },
+      ],
+    })
+    const msgWithText = createUserMessage({
+      content: [
+        { type: 'text' as const, text: 'User query here' },
+      ],
+    })
+    const asstTool = createAssistantMessage({
+      content: [
+        {
+          type: 'tool_use' as const,
+          id: 't1',
+          name: 'Bash',
+          input: { command: 'ls -la' },
+        },
+      ],
+    })
+    const msgWithResultAndText = createUserMessage({
+      content: [
+        { type: 'tool_result' as const, tool_use_id: 't1', content: 'file output data' },
+        { type: 'text' as const, text: 'based on that output I think the answer is yes' },
+      ],
+    })
+
+    const messages: Message[] = [msg, msgWithText, asstTool, msgWithResultAndText]
+
+    const total = estimateMessageTokens(messages)
+
+    // Must be significantly > 0 (all blocks counted)
+    expect(total).toBeGreaterThan(100)
+
+    // Must be larger than the old reducer's estimate (only string+text blocks)
+    // Old reducer would only see text blocks: 'User query here' + 'based on that output...'
+    // It would miss 5000-chars tool_result, tool_use name+input
+    const oldReducerEstimate = Math.ceil(
+      (13 + 46) * (4 / 3), // 'User query here' (13) + 'based on that...' (~46)
+    )
+    expect(total).toBeGreaterThan(oldReducerEstimate * 2)
   })
 })

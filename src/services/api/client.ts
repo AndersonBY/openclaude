@@ -53,11 +53,18 @@ import {
   type ProviderOverride,
 } from './authRouting.js'
 import { AnthropicVertex } from './vertexClient.js'
+import { importOptionalRuntimeModule } from '../../utils/optionalRuntimeModule.js'
 
-const importRuntimeModule = new Function(
-  'specifier',
-  'return import(specifier)',
-) as (specifier: string) => Promise<any>
+type OptionalRuntimeImporter = typeof importOptionalRuntimeModule
+
+let importOptionalRuntimeModuleForClient: OptionalRuntimeImporter =
+  importOptionalRuntimeModule
+
+export function _setOptionalRuntimeModuleImporterForTesting(
+  importer?: OptionalRuntimeImporter,
+): void {
+  importOptionalRuntimeModuleForClient = importer ?? importOptionalRuntimeModule
+}
 
 /**
  * Environment variables for different client types:
@@ -314,6 +321,24 @@ function applyFireworksEnvOnlyDefaults(): void {
   delete process.env.OPENAI_AUTH_HEADER_VALUE
 }
 
+function applyAimlapiEnvOnlyDefaults(): void {
+  const baseUrlOverride =
+    process.env.OPENAI_BASE_URL?.trim() ||
+    process.env.OPENAI_API_BASE?.trim() ||
+    undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('aimlapi')
+  process.env.OPENAI_MODEL = modelOverride ?? getRouteDefaultModel('aimlapi')
+  process.env.OPENAI_API_KEY = process.env.AIMLAPI_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
 export async function getAnthropicClient({
   apiKey,
   maxRetries,
@@ -419,6 +444,8 @@ export async function getAnthropicClient({
     envOnlyProviderRouteId === 'nearai' && !useMiniMaxEnvOnlyProvider
   const useFireworksEnvOnlyProvider =
     envOnlyProviderRouteId === 'fireworks' && !useMiniMaxEnvOnlyProvider
+  const useAimlapiEnvOnlyProvider =
+    envOnlyProviderRouteId === 'aimlapi' && !useMiniMaxEnvOnlyProvider
   if (useMiniMaxEnvOnlyProvider) {
     applyMiniMaxEnvOnlyDefaults(model)
   }
@@ -433,6 +460,9 @@ export async function getAnthropicClient({
   }
   if (useFireworksEnvOnlyProvider) {
     applyFireworksEnvOnlyDefaults()
+  }
+  if (useAimlapiEnvOnlyProvider) {
+    applyAimlapiEnvOnlyDefaults()
   }
 
   const shouldUseFirstPartyAuth =
@@ -512,6 +542,7 @@ export async function getAnthropicClient({
     useXaiEnvOnlyProvider ||
     useNearaiEnvOnlyProvider ||
     useFireworksEnvOnlyProvider ||
+    useAimlapiEnvOnlyProvider ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI) ||
@@ -526,7 +557,15 @@ export async function getAnthropicClient({
     }) as unknown as Anthropic
   }
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)) {
-    const { AnthropicBedrock } = await import('@anthropic-ai/bedrock-sdk')
+    // Loaded via the runtime importer (not a static `import()`), so esbuild
+    // stays blind to it and does NOT inline @anthropic-ai/bedrock-sdk — which
+    // statically imports @aws-sdk/client-bedrock-runtime. Inlining would hoist
+    // that AWS import into the CLI bundle and require it at startup for every
+    // user. Keeping it lazy means only Bedrock users install the SDK (which
+    // pulls @aws-sdk transitively).
+    const { AnthropicBedrock } = await importOptionalRuntimeModuleForClient<
+      typeof import('@anthropic-ai/bedrock-sdk')
+    >('@anthropic-ai/bedrock-sdk', 'AWS Bedrock')
     // Use region override for small fast model if specified
     const awsRegion =
       model === getSmallFastModel() &&
@@ -570,9 +609,9 @@ export async function getAnthropicClient({
     ) as unknown as Anthropic
   }
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)) {
-    const { AnthropicFoundry } = await importRuntimeModule(
-      '@anthropic-ai/foundry-sdk',
-    )
+    const { AnthropicFoundry } = await importOptionalRuntimeModuleForClient<
+      typeof import('@anthropic-ai/foundry-sdk')
+    >('@anthropic-ai/foundry-sdk', 'Azure Foundry')
     // Determine Azure AD token provider based on configuration
     // SDK reads ANTHROPIC_FOUNDRY_API_KEY by default
     let azureADTokenProvider: (() => Promise<string>) | undefined
@@ -585,7 +624,10 @@ export async function getAnthropicClient({
         const {
           DefaultAzureCredential: AzureCredential,
           getBearerTokenProvider,
-        } = await importRuntimeModule('@azure/identity')
+        } =
+          await importOptionalRuntimeModuleForClient<
+            typeof import('@azure/identity')
+          >('@azure/identity', 'Azure Foundry authentication')
         azureADTokenProvider = getBearerTokenProvider(
           new AzureCredential(),
           'https://cognitiveservices.azure.com/.default',
@@ -608,7 +650,6 @@ export async function getAnthropicClient({
       await refreshGcpCredentialsIfNeeded()
     }
 
-    const { GoogleAuth } = await importRuntimeModule('google-auth-library')
     // TODO: Cache either GoogleAuth instance or AuthClient to improve performance
     // Currently we create a new GoogleAuth instance for every getAnthropicClient() call
     // This could cause repeated authentication flows and metadata server checks
@@ -643,33 +684,42 @@ export async function getAnthropicClient({
       process.env['GOOGLE_APPLICATION_CREDENTIALS'] ||
       process.env['google_application_credentials']
 
-    const googleAuth = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)
-      ? ({
-          // Mock GoogleAuth for testing/proxy scenarios
-          getClient: () => ({
-            getRequestHeaders: () => ({}),
-          }),
-        } as {
-          getClient: () => {
-            getRequestHeaders: () => Record<string, string>
-          }
-        })
-      : new GoogleAuth({
-          scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-          // Only use ANTHROPIC_VERTEX_PROJECT_ID as last resort fallback
-          // This prevents the 12-second metadata server timeout when:
-          // - No project env vars are set AND
-          // - No credential keyfile is specified AND
-          // - ADC file exists but lacks project_id field
-          //
-          // Risk: If auth project != API target project, this could cause billing/audit issues
-          // Mitigation: Users can set GOOGLE_CLOUD_PROJECT to override
-          ...(hasProjectEnvVar || hasKeyFile
-            ? {}
-            : {
-                projectId: process.env.ANTHROPIC_VERTEX_PROJECT_ID,
-              }),
-        })
+    let googleAuth: {
+      getClient: () => { getRequestHeaders: () => Record<string, string> }
+    }
+    if (isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)) {
+      // Mock GoogleAuth for testing/proxy scenarios. This path intentionally
+      // does NOT load google-auth-library — proxy/test runs must work even when
+      // the optional package is absent (it is only needed for real auth below).
+      googleAuth = {
+        getClient: () => ({
+          getRequestHeaders: () => ({}),
+        }),
+      }
+    } else {
+      const { GoogleAuth } = await importOptionalRuntimeModuleForClient<
+        typeof import('google-auth-library')
+      >('google-auth-library', 'Vertex AI (GCP) authentication')
+      // The real GoogleAuth (async getClient) is wider than the minimal shape
+      // declared above and shared with the mock; AnthropicVertex accepts it at
+      // runtime, so narrow it back to the shared shape here.
+      googleAuth = new GoogleAuth({
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+        // Only use ANTHROPIC_VERTEX_PROJECT_ID as last resort fallback
+        // This prevents the 12-second metadata server timeout when:
+        // - No project env vars are set AND
+        // - No credential keyfile is specified AND
+        // - ADC file exists but lacks project_id field
+        //
+        // Risk: If auth project != API target project, this could cause billing/audit issues
+        // Mitigation: Users can set GOOGLE_CLOUD_PROJECT to override
+        ...(hasProjectEnvVar || hasKeyFile
+          ? {}
+          : {
+              projectId: process.env.ANTHROPIC_VERTEX_PROJECT_ID,
+            }),
+      }) as unknown as typeof googleAuth
+    }
 
     const vertexArgs = {
       ...ARGS,

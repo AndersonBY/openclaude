@@ -155,14 +155,16 @@ export function getAbsoluteAndRelativePaths(path: string | undefined): {
 export function getDisplayPath(filePath: string): string {
   // Use relative path if file is in the current working directory
   const { relativePath } = getAbsoluteAndRelativePaths(filePath)
-  if (relativePath && !relativePath.startsWith('..')) {
+  if (relativePath && !relativePath.startsWith('..') && !isAbsolute(relativePath)) {
     return relativePath
   }
 
   // Use tilde notation for files in home directory
   const homeDir = homedir()
-  if (filePath.startsWith(homeDir + sep)) {
-    return '~' + filePath.slice(homeDir.length)
+  const normalizedFilePath = filePath.replace(/\\/g, '/')
+  const normalizedHomeDir = homeDir.replace(/\\/g, '/')
+  if (normalizedFilePath.startsWith(normalizedHomeDir + '/')) {
+    return '~' + normalizedFilePath.slice(normalizedHomeDir.length)
   }
 
   // Otherwise return the absolute path

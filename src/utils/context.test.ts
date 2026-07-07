@@ -21,6 +21,7 @@ const originalEnv = {
   OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
   OPENAI_API_BASE: process.env.OPENAI_API_BASE,
   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  AIMLAPI_API_KEY: process.env.AIMLAPI_API_KEY,
   OPENAI_MODEL: process.env.OPENAI_MODEL,
   CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED:
     process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED,
@@ -42,6 +43,7 @@ beforeEach(async () => {
   delete process.env.OPENAI_BASE_URL
   delete process.env.OPENAI_API_BASE
   delete process.env.OPENAI_API_KEY
+  delete process.env.AIMLAPI_API_KEY
   delete process.env.OPENAI_MODEL
   delete process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED
   delete process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID
@@ -95,6 +97,11 @@ afterEach(() => {
       delete process.env.OPENAI_API_KEY
     } else {
       process.env.OPENAI_API_KEY = originalEnv.OPENAI_API_KEY
+    }
+    if (originalEnv.AIMLAPI_API_KEY === undefined) {
+      delete process.env.AIMLAPI_API_KEY
+    } else {
+      process.env.AIMLAPI_API_KEY = originalEnv.AIMLAPI_API_KEY
     }
     if (originalEnv.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED === undefined) {
       delete process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED
@@ -496,6 +503,7 @@ test('unknown openai-compatible model fallback logs one debug warning and no con
     actualDebugModule,
     'logForDebugging',
   ).mockImplementation((_message, _options) => {})
+  const initialDebugCalls = logForDebugging.mock.calls.length
 
   const originalConsoleError = console.error
   const consoleError = mock(() => {})
@@ -512,8 +520,9 @@ test('unknown openai-compatible model fallback logs one debug warning and no con
       contextModule.getContextWindowForModel('another-unknown-3p-model'),
     ).toBe(128_000)
     expect(consoleError).not.toHaveBeenCalled()
-    expect(logForDebugging).toHaveBeenCalledTimes(1)
-    expect(logForDebugging.mock.calls[0]?.[1]).toEqual({ level: 'warn' })
+    const debugCalls = logForDebugging.mock.calls.slice(initialDebugCalls)
+    expect(debugCalls).toHaveLength(1)
+    expect(debugCalls[0]?.[1]).toEqual({ level: 'warn' })
   } finally {
     console.error = originalConsoleError
     mock.restore()

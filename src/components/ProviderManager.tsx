@@ -49,7 +49,9 @@ import { openAIShimSupportsApiFormatForModel } from '../integrations/runtimeMeta
 import { probeRouteReadiness } from '../integrations/discoveryService.js'
 import {
   addProviderProfile,
+  ANTHROPIC_DEFAULT_PROFILE_ID,
   applyActiveProviderProfileFromConfig,
+  clearActiveProviderProfile,
   deleteProviderProfile,
   getActiveProviderProfile,
   getProviderPresetDefaults,
@@ -59,8 +61,10 @@ import {
   type ProviderProfileInput,
   updateProviderProfile,
 } from '../utils/providerProfiles.js'
+import { getDefaultMainLoopModelSetting } from '../utils/model/model.js'
 import {
   clearGithubModelsToken,
+  clearHydratedGithubModelsTokenFromEnv,
   GITHUB_MODELS_HYDRATED_ENV_MARKER,
   hydrateGithubModelsTokenFromSecureStorage,
   readGithubModelsToken,
@@ -75,7 +79,7 @@ import {
   recommendOllamaModel,
 } from '../utils/providerRecommendation.js'
 import { clearStartupProviderOverrides } from '../utils/providerStartupOverrides.js'
-import { redactUrlForDisplay } from '../utils/urlRedaction.js'
+import { redactUrlForDisplay } from '../utils/redaction.js'
 import { updateSettingsForSource } from '../utils/settings/settings.js'
 import {
   type OptionWithDescription,
@@ -214,6 +218,7 @@ const FORM_STEPS: Array<{
 
 const GITHUB_PROVIDER_ID = '__github_models__'
 const GITHUB_PROVIDER_LABEL = 'GitHub Models'
+const ANTHROPIC_PROVIDER_LABEL = 'Anthropic (built-in)'
 const GITHUB_PROVIDER_DEFAULT_MODEL = 'github:copilot'
 const GITHUB_PROVIDER_DEFAULT_BASE_URL = 'https://models.github.ai/inference'
 const CODEX_OAUTH_PROVIDER_NAME = 'Codex OAuth'
@@ -602,6 +607,40 @@ function XaiManualCodeInput({
   )
 }
 
+function CodexManualCallbackInput({
+  onSubmit,
+}: {
+  onSubmit: (input: string) => void
+}): React.ReactNode {
+  const [value, setValue] = React.useState('')
+  const [cursorOffset, setCursorOffset] = React.useState(0)
+  const { columns: terminalColumns } = useTerminalSize()
+  const inputColumns = Math.max(20, Math.min(120, terminalColumns - 12))
+  return (
+    <Box>
+      <Text>Callback URL › </Text>
+      <TextInput
+        value={value}
+        onChange={setValue}
+        cursorOffset={cursorOffset}
+        onChangeCursorOffset={setCursorOffset}
+        columns={inputColumns}
+        onSubmit={submitted => {
+          const trimmed = submitted.trim()
+          if (trimmed) onSubmit(trimmed)
+        }}
+        // The pasted callback URL carries the OAuth `code` and `state` query
+        // params — enough to complete the in-flight exchange — so mask it the
+        // same way the xAI manual-code field above does, to keep it out of
+        // terminal scrollback, recordings, and shared sessions.
+        mask="*"
+        // The parent `CodexOAuthSetup` owns Esc via `useKeybinding('confirm:no')`.
+        disableEscapeDoublePress
+      />
+    </Box>
+  )
+}
+
 function CodexOAuthSetup({
   onBack,
   onConfigured,
@@ -638,6 +677,10 @@ function CodexOAuthSetup({
   const status = useCodexOAuthFlow({
     onAuthenticated: handleAuthenticated,
   })
+  const [pasteError, setPasteError] = React.useState<string | undefined>()
+  const isRemoteSession = Boolean(
+    process.env['SSH_CONNECTION'] || process.env['SSH_CLIENT'],
+  )
 
   if (status.state === 'error') {
     return (
@@ -693,6 +736,34 @@ function CodexOAuthSetup({
       ) : (
         <Text dimColor>Opening your browser...</Text>
       )}
+      {status.state === 'waiting' ? (
+        <>
+          {isRemoteSession ? (
+            <Text color="warning">
+              SSH session detected — the browser cannot reach this host's
+              localhost callback. After signing in, copy the full URL your
+              browser was redirected to (it starts with http://localhost:) and
+              paste it below.
+            </Text>
+          ) : (
+            <Text dimColor>
+              If the browser cannot reach localhost (remote / containerized
+              session), paste the full callback URL it was redirected to:
+            </Text>
+          )}
+          <CodexManualCallbackInput
+            onSubmit={input => {
+              const result = status.submitManualCallback(input)
+              if (!result.ok) {
+                setPasteError(result.error)
+              } else {
+                setPasteError(undefined)
+              }
+            }}
+          />
+          {pasteError ? <Text color="error">{pasteError}</Text> : null}
+        </>
+      ) : null}
       <Text dimColor>Press Esc to cancel and go back.</Text>
     </Box>
   )
@@ -814,6 +885,15 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   // array reference, causing Select to re-render and feel sluggish.
   const hasProfiles = profiles.length > 0
   const hasSelectableProviders = hasProfiles || githubProviderAvailable
+  // A non-Anthropic provider (a saved profile or GitHub Models) is currently
+  // active. The switch-back-to-Anthropic recovery option must stay reachable
+  // in that case even when no profiles are saved and GitHub credentials have
+  // gone away (cleared storage / removed env token); otherwise the user is
+  // stranded on an unusable provider with no way back. Scoped to the activate
+  // path only — edit/delete still require an actual profile.
+  const isNonAnthropicProviderActive = isGithubActive || activeProfileId != null
+  const canSwitchActiveProvider =
+    hasSelectableProviders || isNonAnthropicProviderActive
   const menuOptions = React.useMemo(
     () => [
       {
@@ -825,7 +905,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         value: 'activate',
         label: 'Set active provider',
         description: 'Switch the active provider profile',
-        disabled: !hasSelectableProviders,
+        disabled: !canSwitchActiveProvider,
       },
       {
         value: 'edit',
@@ -865,6 +945,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     ],
     [
       hasSelectableProviders,
+      canSwitchActiveProvider,
       hasProfiles,
       hasStoredCodexOAuthCredentials,
       hasStoredXaiOAuthCredentials,
@@ -1222,6 +1303,50 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         return
       }
 
+      if (profileId === ANTHROPIC_DEFAULT_PROFILE_ID) {
+        providerLabel = ANTHROPIC_PROVIDER_LABEL
+        // Switch back to built-in Anthropic: clears the managed provider env so
+        // it takes effect this session, records the Anthropic sentinel so
+        // startup no longer replays a third-party profile, and keeps saved
+        // profiles for later re-selection (#1426).
+        clearActiveProviderProfile()
+        // clearActiveProviderProfile clears the managed provider flags (e.g.
+        // CLAUDE_CODE_USE_GITHUB) but not a GitHub Models token hydrated into the
+        // session from secure storage. Drop that hydrated token + marker so the
+        // built-in Anthropic session does not keep a GitHub credential around,
+        // mirroring the GitHub delete path; a user-supplied token is preserved.
+        clearHydratedGithubModelsTokenFromEnv(readGithubModelsToken())
+        // Clear any startup provider override persisted in user settings
+        // (CLAUDE_CODE_USE_OPENAI, OPENAI_BASE_URL, provider API keys, ...) so a
+        // restart does not replay the third-party provider. The saved-profile
+        // and GitHub activation paths perform the same cleanup; surface any
+        // failure as a warning the same way the saved-profile path does.
+        const settingsOverrideError = clearStartupProviderOverrideFromUserSettings()
+        const anthropicModel = getPrimaryModel(getDefaultMainLoopModelSetting())
+        setAppState(prev => ({
+          ...prev,
+          mainLoopModel: anthropicModel,
+          mainLoopModelForSession: null,
+        }))
+        refreshProfiles()
+        setStatusMessage(
+          settingsOverrideError
+            ? `Active provider: ${ANTHROPIC_PROVIDER_LABEL}. Warning: could not clear startup provider override (${settingsOverrideError}).`
+            : `Active provider: ${ANTHROPIC_PROVIDER_LABEL}`,
+        )
+        setIsActivating(false)
+        onDone({
+          action: 'activated',
+          activeProviderName: ANTHROPIC_PROVIDER_LABEL,
+          activeProviderModel: anthropicModel,
+          message: settingsOverrideError
+            ? `Provider switched to ${ANTHROPIC_PROVIDER_LABEL} (${anthropicModel}). Warning: could not clear startup provider override (${settingsOverrideError}).`
+            : `Provider switched to ${ANTHROPIC_PROVIDER_LABEL} (${anthropicModel})`,
+        })
+        returnToMenu()
+        return
+      }
+
       const active = setActiveProviderProfile(profileId)
       if (!active) {
         setErrorMessage('Could not change active provider.')
@@ -1384,17 +1509,14 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       return error.message
     }
 
-    const hydratedTokenInSession = process.env.GITHUB_TOKEN?.trim()
-    if (
-      process.env[GITHUB_MODELS_HYDRATED_ENV_MARKER] === '1' &&
-      hydratedTokenInSession &&
-      (!storedTokenBeforeClear || hydratedTokenInSession === storedTokenBeforeClear)
-    ) {
-      delete process.env.GITHUB_TOKEN
-    }
-
     delete process.env.CLAUDE_CODE_USE_GITHUB
-    delete process.env[GITHUB_MODELS_HYDRATED_ENV_MARKER]
+    // Undo any GitHub Models token hydrated into the session from secure
+    // storage and drop the marker. Use the shared helper so both hydration
+    // modes are reverted: GITHUB_TOKEN and the copilot_key blob's
+    // GITHUB_COPILOT_KEY. The old hand-rolled cleanup here only cleared
+    // GITHUB_TOKEN, leaving a hydrated Copilot key behind after the marker was
+    // removed. A user-supplied token is preserved.
+    clearHydratedGithubModelsTokenFromEnv(storedTokenBeforeClear)
     delete process.env.OPENAI_MODEL
     delete process.env.OPENAI_API_KEYS
     delete process.env.OPENAI_API_KEY
@@ -2147,6 +2269,8 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     // Use memoized menuOptions from component scope
     const hasProfiles = profiles.length > 0
     const hasSelectableProviders = hasProfiles || githubProviderAvailable
+    // canSwitchActiveProvider is derived once in the component body; reuse it
+    // here rather than recomputing so the two sites cannot drift.
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -2192,7 +2316,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
                 setScreen('select-preset')
                 break
               case 'activate':
-                if (hasSelectableProviders) {
+                if (canSwitchActiveProvider) {
                   setScreen('select-active')
                 }
                 break
@@ -2305,9 +2429,10 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     title: string,
     emptyMessage: string,
     onSelect: (profileId: string) => void,
-    options?: { includeGithub?: boolean },
+    options?: { includeGithub?: boolean; includeAnthropic?: boolean },
   ): React.ReactNode {
     const includeGithub = options?.includeGithub ?? false
+    const includeAnthropic = options?.includeAnthropic ?? false
     const selectOptions = profiles.map(profile => ({
       value: profile.id,
       label:
@@ -2324,6 +2449,18 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           ? `${GITHUB_PROVIDER_LABEL} (active)`
           : GITHUB_PROVIDER_LABEL,
         description: `github-models · ${GITHUB_PROVIDER_DEFAULT_BASE_URL} · ${getGithubProviderModel()}`,
+      })
+    }
+
+    // Offer a way back to built-in Anthropic only when a third-party provider
+    // (saved profile or GitHub Models) is currently active — otherwise the user
+    // is already on Anthropic and the option is a no-op (#1426).
+    if (includeAnthropic && (activeProfileId || isGithubActive)) {
+      selectOptions.push({
+        value: ANTHROPIC_DEFAULT_PROFILE_ID,
+        label: 'Use Anthropic (built-in)',
+        description:
+          'Switch back to Claude now without a restart — saved profiles are kept',
       })
     }
 
@@ -2565,7 +2702,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         profileId => {
           void activateSelectedProvider(profileId)
         },
-        { includeGithub: true },
+        { includeGithub: true, includeAnthropic: true },
       )
       break
     case 'select-edit':

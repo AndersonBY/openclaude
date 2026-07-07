@@ -1,14 +1,41 @@
 import { describe, expect, mock, test } from 'bun:test'
 
-import { clearStartupProviderOverrides } from './providerStartupOverrides.js'
+async function importProviderStartupOverrides() {
+  return (await import(
+    `./providerStartupOverrides.ts?actual=${Date.now()}-${Math.random()}`
+  )) as typeof import('./providerStartupOverrides.js')
+}
+
+type ClearStartupProviderOverrides =
+  typeof import('./providerStartupOverrides.js').clearStartupProviderOverrides
+type ClearStartupProviderOverridesOptions = NonNullable<
+  Parameters<ClearStartupProviderOverrides>[0]
+>
+type UpdateUserSettings = NonNullable<
+  ClearStartupProviderOverridesOptions['updateUserSettings']
+>
+type SaveConfig = NonNullable<
+  ClearStartupProviderOverridesOptions['saveConfig']
+>
 
 describe('clearStartupProviderOverrides', () => {
-  test('removes stale provider env from user settings and global config env', () => {
-    const updateUserSettings = mock(() => ({ error: null }))
-    const saveConfig = mock((updater: (current: {
-      env: Record<string, string>
-    }) => { env: Record<string, string> }) =>
-      updater({
+  test('removes stale provider env from user settings and global config env', async () => {
+    mock.restore()
+    const { clearStartupProviderOverrides } =
+      await importProviderStartupOverrides()
+    let updateUserSettingsCall:
+      | [string, { env?: Record<string, string | undefined> }]
+      | undefined
+    let savedConfig: { env: Record<string, string> } | undefined
+    const updateUserSettings: UpdateUserSettings = (source, settings) => {
+      updateUserSettingsCall = [
+        source,
+        settings as { env?: Record<string, string | undefined> },
+      ]
+      return { error: null }
+    }
+    const saveConfig: SaveConfig = updater => {
+      const updated = updater({
         env: {
           CLAUDE_CODE_USE_OPENAI: '1',
           OPENAI_BASE_URL: 'https://api.minimax.io/v1',
@@ -19,16 +46,18 @@ describe('clearStartupProviderOverrides', () => {
           VENICE_API_KEY: 'sk-venice',
           KEEP_ME: '1',
         },
-      }),
-    )
+      })
+      savedConfig = { env: updated.env ?? {} }
+      return savedConfig
+    }
 
     const error = clearStartupProviderOverrides({
       updateUserSettings,
-      saveConfig: saveConfig as any,
+      saveConfig,
     })
 
     expect(error).toBeNull()
-    expect(updateUserSettings).toHaveBeenCalledWith(
+    expect(updateUserSettingsCall).toEqual([
       'userSettings',
       expect.objectContaining({
         env: expect.objectContaining({
@@ -41,9 +70,7 @@ describe('clearStartupProviderOverrides', () => {
           VENICE_API_KEY: undefined,
         }),
       }),
-    )
-    expect(
-      (saveConfig.mock.results[0]?.value as { env: Record<string, string> }).env,
-    ).toEqual({ KEEP_ME: '1' })
+    ])
+    expect(savedConfig?.env).toEqual({ KEEP_ME: '1' })
   })
 })

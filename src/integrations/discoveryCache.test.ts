@@ -22,7 +22,7 @@ import {
   releaseSharedMutationLock,
 } from '../test/sharedMutationLock.js'
 
-const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+const originalOpenClaudeConfigDir = process.env.OPENCLAUDE_CONFIG_DIR
 
 let tempDir: string
 
@@ -37,7 +37,7 @@ function createModel(id: string): ModelCatalogEntry {
 beforeEach(async () => {
   await acquireSharedMutationLock('discoveryCache.test.ts')
   tempDir = mkdtempSync(join(tmpdir(), 'openclaude-discovery-cache-test-'))
-  process.env.CLAUDE_CONFIG_DIR = tempDir
+  process.env.OPENCLAUDE_CONFIG_DIR = tempDir
   setOriginalFsImplementation()
   await clearDiscoveryCache()
 })
@@ -45,10 +45,10 @@ beforeEach(async () => {
 afterEach(() => {
   try {
     setOriginalFsImplementation()
-    if (originalConfigDir === undefined) {
-      delete process.env.CLAUDE_CONFIG_DIR
+    if (originalOpenClaudeConfigDir === undefined) {
+      delete process.env.OPENCLAUDE_CONFIG_DIR
     } else {
-      process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+      process.env.OPENCLAUDE_CONFIG_DIR = originalOpenClaudeConfigDir
     }
     rmSync(tempDir, { recursive: true, force: true })
   } finally {

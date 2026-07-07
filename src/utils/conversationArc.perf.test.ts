@@ -1,10 +1,14 @@
 import { describe, expect, it, beforeEach, afterEach } from 'bun:test'
+import { existsSync, mkdtempSync, renameSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { 
   initializeArc, 
   updateArcPhase, 
   getArcSummary,
-  resetArc 
+  resetArc,
 } from './conversationArc.js'
+import { setClaudeConfigHomeDirForTesting } from './envUtils.js'
 import { getGlobalGraph, clearMemoryOnly, resetGlobalGraph } from './knowledgeGraph.js'
 import {
   acquireSharedMutationLock,
@@ -18,9 +22,49 @@ function createMessage(content: string): any {
   }
 }
 
+function sleepSync(ms: number): void {
+  const shared = new SharedArrayBuffer(4)
+  const view = new Int32Array(shared)
+  Atomics.wait(view, 0, 0, ms)
+}
+
+function rmDirWithRetry(path: string): void {
+  const maxAttempts = 8
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      rmSync(path, { recursive: true, force: true })
+      if (!existsSync(path)) return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'EBUSY' && code !== 'EPERM') {
+        throw error
+      }
+    }
+
+    sleepSync(25 * (attempt + 1))
+  }
+
+  const stalePath = `${path}.stale-${Date.now()}`
+  try {
+    renameSync(path, stalePath)
+  } catch (error) {
+    if (existsSync(path)) {
+      process.once('exit', () => {
+        try {
+          rmSync(path, { recursive: true, force: true })
+        } catch {}
+      })
+    }
+  }
+}
+
 describe('Conversation Arc Scale and Stability', () => {
+  let configDir: string
+
   beforeEach(async () => {
     await acquireSharedMutationLock('conversationArc.perf')
+    configDir = mkdtempSync(join(tmpdir(), 'openclaude-arc-perf-'))
+    setClaudeConfigHomeDirForTesting(configDir)
     resetGlobalGraph()
     clearMemoryOnly()
     resetArc()
@@ -32,6 +76,8 @@ describe('Conversation Arc Scale and Stability', () => {
       resetGlobalGraph()
       clearMemoryOnly()
       resetArc()
+      setClaudeConfigHomeDirForTesting(undefined)
+      rmDirWithRetry(configDir)
     } finally {
       releaseSharedMutationLock()
     }
