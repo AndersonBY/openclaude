@@ -26,7 +26,11 @@
 import { getOauthConfig } from '../constants/oauth.js'
 import { createCombinedAbortSignal } from './combinedAbortSignal.js'
 import { isEnvTruthy } from './envUtils.js'
-import { type APIProvider, getAPIProvider } from './model/providers.js'
+import {
+  type APIProvider,
+  getAPIProvider,
+  isFirstPartyAnthropicBaseUrl,
+} from './model/providers.js'
 
 let fired = false
 
@@ -46,7 +50,7 @@ export function preconnectAnthropicApi(
   }
 
   // Third-party providers should not warm a connection to Anthropic.
-  if (apiProvider !== 'firstParty') {
+  if (apiProvider !== 'firstParty' || !isFirstPartyAnthropicBaseUrl()) {
     return
   }
 

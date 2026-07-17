@@ -15,14 +15,18 @@
 import '../integrations/index.js'
 import {
   ensureIntegrationsLoaded,
+  getAnthropicProxy,
+  getAllAnthropicProxies,
   getAllGateways,
   getAllVendors,
   getGateway,
   getVendor,
+  isCloudflareBaseUrl,
   resolveProfileRoute,
   resolveRouteIdFromBaseUrl,
 } from '../integrations/index.js'
 import { PRESET_VENDOR_MAP } from '../integrations/compatibility.js'
+import { isFirstPartyAnthropicBaseUrlForEnv } from './anthropicBaseUrl.js'
 
 const PREFERRED_PROVIDER_ORDER = [
   'anthropic',
@@ -52,6 +56,7 @@ function buildValidProviders(): string[] {
     ...PRESET_VENDOR_MAP.map(mapping => mapping.preset),
     ...getAllVendors().map(vendor => vendor.id),
     ...getAllGateways().map(gateway => gateway.id),
+    ...getAllAnthropicProxies().map(proxy => proxy.id),
   ])
 
   const preferred = PREFERRED_PROVIDER_ORDER.filter(provider =>
@@ -149,11 +154,12 @@ function getRouteDefaults(provider: string): {
   const gateway =
     (route.gatewayId ? getGateway(route.gatewayId) : undefined) ??
     getGateway(route.routeId)
+  const anthropicProxy = getAnthropicProxy(route.routeId)
 
-  const defaultModel = gateway?.defaultModel ?? vendor?.defaultModel
+  const defaultModel = gateway?.defaultModel ?? vendor?.defaultModel ?? anthropicProxy?.defaultModel
 
   return {
-    defaultBaseUrl: gateway?.defaultBaseUrl ?? vendor?.defaultBaseUrl,
+    defaultBaseUrl: gateway?.defaultBaseUrl ?? vendor?.defaultBaseUrl ?? anthropicProxy?.defaultBaseUrl,
     defaultModel,
   }
 }
@@ -189,9 +195,26 @@ function shouldReplaceStaleKnownBaseUrl(provider: string): boolean {
   )
 }
 
+// Descriptor defaults can carry an unresolved `<...>` placeholder that the user
+// must replace before the endpoint works — e.g. Cloudflare Workers AI's
+// `https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1`. Seeding it
+// verbatim would leave the shortcut "configured" with an endpoint that cannot
+// serve a single request.
+function isPlaceholderBaseUrl(baseUrl: string): boolean {
+  return /<[^>]+>/.test(baseUrl)
+}
+
 function applyOpenAIBaseUrlDefault(provider: string, baseUrl?: string): void {
   const normalizedBaseUrl = baseUrl?.trim()
   if (!normalizedBaseUrl) {
+    return
+  }
+
+  // Never seed an unresolved placeholder endpoint. The user must supply a real
+  // base URL (via `OPENAI_BASE_URL` or the `/provider` baseUrl edit) first; the
+  // `/provider` wizard treats such defaults as requiring explicit setup, and
+  // the CLI shortcut should not silently install a broken endpoint.
+  if (isPlaceholderBaseUrl(normalizedBaseUrl)) {
     return
   }
 
@@ -301,7 +324,10 @@ export function applyProviderFlag(
                       opengatewayApiKey.length > 0 &&
                       process.env.OPENAI_API_KEY === opengatewayApiKey
                     ? 'gitlawb-opengateway'
-                    : null
+                    : process.env.OPENAI_API_KEY !== undefined &&
+                        process.env.OPENAI_API_KEY === process.env.CLOUDFLARE_API_TOKEN
+                      ? 'cloudflare'
+                      : null
 
   delete process.env.CLAUDE_CODE_USE_OPENAI
   delete process.env.CLAUDE_CODE_USE_GEMINI
@@ -309,6 +335,7 @@ export function applyProviderFlag(
   delete process.env.CLAUDE_CODE_USE_GITHUB
   delete process.env.CLAUDE_CODE_USE_BEDROCK
   delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
   delete process.env.NVIDIA_NIM
   if (copiedOpenAIKeyProvider && provider !== copiedOpenAIKeyProvider) {
     delete process.env.OPENAI_API_KEY
@@ -318,8 +345,55 @@ export function applyProviderFlag(
   const { defaultBaseUrl, defaultModel } = getRouteDefaults(provider)
 
   switch (provider) {
-    case 'anthropic':
-      // Default — no env vars needed
+    case 'anthropic': {
+      // Default — clear any custom native proxy contract so this explicit
+      // provider flag cannot keep routing requests to a prior endpoint.
+      // Preserve a first-party API key: it is the normal credential for this
+      // provider and may have been supplied directly through the environment.
+      const hadCustomAnthropicEndpoint =
+        !isFirstPartyAnthropicBaseUrlForEnv(process.env)
+      delete process.env.ANTHROPIC_BASE_URL
+      delete process.env.ANTHROPIC_MODEL
+      if (hadCustomAnthropicEndpoint) {
+        delete process.env.ANTHROPIC_API_KEY
+      }
+      delete process.env.ANTHROPIC_AUTH_TOKEN
+      delete process.env.ANTHROPIC_CUSTOM_HEADERS
+      break
+    }
+
+    case 'custom-anthropic':
+      if (!process.env.ANTHROPIC_BASE_URL?.trim()) {
+        return {
+          error: 'Custom Anthropic-compatible provider requires ANTHROPIC_BASE_URL.',
+        }
+      }
+      if (isFirstPartyAnthropicBaseUrlForEnv(process.env)) {
+        return {
+          error: 'Custom Anthropic-compatible provider requires a non-Anthropic ANTHROPIC_BASE_URL.',
+        }
+      }
+      const hasAuthToken = Boolean(process.env.ANTHROPIC_AUTH_TOKEN?.trim())
+      const hasApiKey = Boolean(process.env.ANTHROPIC_API_KEY?.trim())
+      if (!hasAuthToken && !hasApiKey) {
+        return {
+          error: 'Custom Anthropic-compatible provider requires ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY.',
+        }
+      }
+      if (hasAuthToken) {
+        delete process.env.ANTHROPIC_API_KEY
+      } else {
+        delete process.env.ANTHROPIC_AUTH_TOKEN
+      }
+      delete process.env.OPENAI_BASE_URL
+      delete process.env.OPENAI_API_BASE
+      delete process.env.OPENAI_MODEL
+      delete process.env.OPENAI_API_FORMAT
+      delete process.env.OPENAI_AUTH_HEADER
+      delete process.env.OPENAI_AUTH_SCHEME
+      delete process.env.OPENAI_AUTH_HEADER_VALUE
+      process.env.ANTHROPIC_MODEL ??= defaultModel
+      if (model) process.env.ANTHROPIC_MODEL = model
       break
 
     case 'openai':
@@ -503,6 +577,44 @@ export function applyProviderFlag(
         process.env.OPENAI_API_KEY = process.env.FIREWORKS_API_KEY
       } else {
         delete process.env.OPENAI_API_KEY
+      }
+      break
+
+    case 'cloudflare':
+      process.env.CLAUDE_CODE_USE_OPENAI = '1'
+      // applyOpenAIBaseUrlDefault skips unresolved `<...>` placeholder
+      // endpoints (the Cloudflare default carries `<ACCOUNT_ID>`), so the
+      // user must export a real account-scoped base URL.
+      applyOpenAIBaseUrlDefault(provider, defaultBaseUrl)
+      if (defaultModel) {
+        process.env.OPENAI_MODEL ??= defaultModel
+      }
+      if (model) process.env.OPENAI_MODEL = model
+      // The Cloudflare transport reads the generic OpenAI-compatible auth
+      // header, so mirror CLOUDFLARE_API_TOKEN into OPENAI_API_KEY the same way
+      // nearai/fireworks mirror their dedicated keys. Gate it on the configured
+      // base URL resolving to a *real* Cloudflare Workers AI endpoint: the host
+      // must be api.cloudflare.com AND the URL must not still carry the
+      // descriptor's unresolved `<ACCOUNT_ID>` placeholder (which shares that
+      // host). Mirroring onto a placeholder or a stale OPENAI_BASE_URL from a
+      // previous provider would leak the token to a host that cannot serve a
+      // request.
+      {
+        const configuredBaseUrl = getConfiguredOpenAIBaseUrl()
+        const isRealCloudflareEndpoint =
+          !!configuredBaseUrl &&
+          isCloudflareBaseUrl(configuredBaseUrl) &&
+          !isPlaceholderBaseUrl(configuredBaseUrl)
+        if (process.env.CLOUDFLARE_API_TOKEN && isRealCloudflareEndpoint) {
+          process.env.OPENAI_API_KEY = process.env.CLOUDFLARE_API_TOKEN
+        } else if (!isRealCloudflareEndpoint) {
+          // Endpoint missing, an unresolved placeholder, or a stale/shared
+          // host: clear any generic key so a stale token isn't leaked.
+          delete process.env.OPENAI_API_KEY
+        }
+        // else: a real Cloudflare endpoint with no dedicated token — keep an
+        // existing OPENAI_API_KEY, the documented compatibility fallback
+        // (descriptor credentialEnvVars lists OPENAI_API_KEY after the token).
       }
       break
 

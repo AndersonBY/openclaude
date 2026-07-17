@@ -370,7 +370,12 @@ export function getPromptCachingEnabled(model: string): boolean {
   // format, so cache_control blocks are supported.
   const provider = getAPIProvider()
   const isNativeGithub = isGithubNativeAnthropicMode(model)
-  if (provider !== 'firstParty' && provider !== 'bedrock' && provider !== 'vertex' && !isNativeGithub) {
+  if (
+    (provider !== 'firstParty' || !isFirstPartyAnthropicBaseUrl()) &&
+    provider !== 'bedrock' &&
+    provider !== 'vertex' &&
+    !isNativeGithub
+  ) {
     return false
   }
 
@@ -481,7 +486,7 @@ function should1hCacheTTL(querySource?: QuerySource): boolean {
  *
  */
 function configureEffortParams(
-  effortValue: EffortValue | undefined,
+  effortValue: Exclude<EffortValue, 'ultracode'> | undefined,
   outputConfig: BetaOutputConfig,
   extraBodyParams: Record<string, unknown>,
   betas: string[],
@@ -1131,6 +1136,7 @@ async function* queryModel(
   // init (~10ms). For non-Opus models (haiku, sonnet) this skips the await
   // entirely. Subscribers don't hit this path at all.
   if (
+    isFirstPartyAnthropicBaseUrl() &&
     !isClaudeAISubscriber() &&
     isNonCustomOpusModel(options.model) &&
     (
@@ -1562,6 +1568,7 @@ async function* queryModel(
       !cacheEditingHeaderLatched &&
       cachedMCEnabled &&
       getAPIProvider() === 'firstParty' &&
+      isFirstPartyAnthropicBaseUrl() &&
       options.querySource === 'repl_main_thread'
     ) {
       cacheEditingHeaderLatched = true
@@ -1801,10 +1808,12 @@ async function* queryModel(
     const useCachedMC =
       cachedMCEnabled &&
       getAPIProvider() === 'firstParty' &&
+      isFirstPartyAnthropicBaseUrl() &&
       options.querySource === 'repl_main_thread'
     if (
       cacheEditingHeaderLatched &&
       getAPIProvider() === 'firstParty' &&
+      isFirstPartyAnthropicBaseUrl() &&
       options.querySource === 'repl_main_thread' &&
       !betasParams.includes(cacheEditingBetaHeader)
     ) {

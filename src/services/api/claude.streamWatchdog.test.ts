@@ -3,6 +3,7 @@ import {
   beforeEach,
   describe,
   expect,
+  spyOn,
   test,
 } from 'bun:test'
 import type {
@@ -22,11 +23,9 @@ import type { Message } from '../../types/message.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { QueryLifecycleOperationTracker } from '../../utils/queryLifecycle.js'
 import { EMPTY_USAGE } from './emptyUsage.js'
-import {
-  queryModelWithStreaming,
-  setAnthropicClientFactoryForTesting,
-  type Options,
-} from './claude.js'
+import type { Options } from './claude.js'
+
+const actualClientModule = await import('./client.js')
 const originalEnv = { ...process.env }
 const hadSavedMacro = Object.hasOwn(globalThis, 'MACRO')
 const savedMacro = (globalThis as Record<string, unknown>).MACRO
@@ -50,6 +49,26 @@ type CreateArgs = [
 type CreateHandler = (...args: CreateArgs) => unknown
 
 let createHandler: CreateHandler | undefined
+let importCounter = 0
+let restoreClientSpy: (() => void) | undefined
+
+function installClientSpy(): void {
+  const clientSpy = spyOn(actualClientModule, 'getAnthropicClient').mockImplementation(
+    async () => ({
+      beta: {
+        messages: {
+          create: (...args: CreateArgs) => {
+            if (!createHandler) {
+              throw new Error('test client create handler not configured')
+            }
+            return createHandler(...args)
+          },
+        },
+      },
+    }) as never,
+  )
+  restoreClientSpy = () => clientSpy.mockRestore()
+}
 
 function makeBetaMessage(
   id: string,
@@ -234,6 +253,9 @@ async function collectStreamingMessages(
   signal: AbortSignal,
   options: Options,
 ): Promise<unknown[]> {
+  const { queryModelWithStreaming } = await import(
+    `./claude.js?stream-watchdog-test-${importCounter++}`
+  )
   const messages: unknown[] = []
   for await (const message of queryModelWithStreaming({
     messages: makeMessages(),
@@ -271,18 +293,7 @@ function setTestMacro(): void {
 
 beforeEach(async () => {
   await acquireSharedMutationLock('claude.streamWatchdog.test.ts')
-  setAnthropicClientFactoryForTesting(async () => ({
-    beta: {
-      messages: {
-        create: (...args: CreateArgs) => {
-          if (!createHandler) {
-            throw new Error('test client create handler not configured')
-          }
-          return createHandler(...args)
-        },
-      },
-    },
-  }) as never)
+  installClientSpy()
   setTestMacro()
   for (const key of envKeys) {
     delete process.env[key]
@@ -297,8 +308,9 @@ beforeEach(async () => {
 
 afterEach(() => {
   try {
+    restoreClientSpy?.()
+    restoreClientSpy = undefined
     createHandler = undefined
-    setAnthropicClientFactoryForTesting(undefined)
     for (const key of envKeys) {
       const envKey: string = key
       if (

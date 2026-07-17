@@ -326,6 +326,17 @@ For direct TEE completions (lower latency, verifiable privacy):
 export OPENAI_BASE_URL=https://qwen35-122b.completions.near.ai/v1
 ```
 
+### Cloudflare Workers AI
+
+```bash
+export CLAUDE_CODE_USE_OPENAI=1
+export CLOUDFLARE_API_TOKEN=...
+export OPENAI_BASE_URL=https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1
+export OPENAI_MODEL=@cf/meta/llama-3.3-70b-instruct-fp8-fast
+```
+
+Replace `<ACCOUNT_ID>` with your Cloudflare account id (visible in the Cloudflare dashboard URL). `OPENAI_API_KEY` also works as a compatibility fallback, but `CLOUDFLARE_API_TOKEN` keeps the profile tied to the Cloudflare preset. The `/provider` Cloudflare Workers AI preset stores the token under `CLOUDFLARE_API_TOKEN`.
+
 ### Mistral
 
 ```bash
@@ -398,6 +409,26 @@ already present as dev dependencies, so source/dev builds need no extra steps.
 
 ## Environment Variables
 
+### Custom (Anthropic-compatible) APIs
+
+For an endpoint that accepts Anthropic's native Messages API, set its base URL,
+Bearer token, and model directly. Do not set `CLAUDE_CODE_USE_OPENAI`; that
+selects the OpenAI-compatible transport instead.
+
+```bash
+export ANTHROPIC_BASE_URL=https://anthropic-proxy.example
+export ANTHROPIC_AUTH_TOKEN=your-provider-token
+export ANTHROPIC_MODEL=your-model-name
+openclaude
+```
+
+`ANTHROPIC_AUTH_TOKEN` is sent as `Authorization: Bearer ...`. The
+`/provider` → `Add provider` menu uses that Bearer-token setup as **Custom
+(Anthropic-compatible)**, including optional extra request headers. For a
+directly configured endpoint that instead requires Anthropic's native
+`x-api-key` authentication, set `ANTHROPIC_API_KEY` in place of the Bearer
+token; do not set both credentials.
+
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `CLAUDE_CODE_USE_OPENAI` | OpenAI-compatible only | Set to `1` to enable the OpenAI-compatible provider path |
@@ -408,6 +439,7 @@ already present as dev dependencies, so source/dev builds need no extra steps.
 | `OPENAI_API_BASE` | No | Compatibility alias for `OPENAI_BASE_URL` |
 | `OPENCLAUDE_OLLAMA_NUM_CTX` | Ollama only | Request-level Ollama context window. Defaults to `32768`; set a larger value for longer same-session history if your model and hardware can handle it. |
 | `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` | No | JSON map of OpenAI-compatible model names to context windows, such as `{"custom-model":1000000}`. Use this when a custom provider does not expose context metadata from `/v1/models`. |
+| `CLAUDE_CODE_OPENAI_MAX_OUTPUT_TOKENS` | No | JSON map of OpenAI-compatible model names to max output tokens, such as `{"custom-model":32768}`. Use this when a custom provider does not expose output-limit metadata from `/v1/models`. |
 | `OPENCODE_API_KEY` | OpenCode Zen / Go | Shared API key for OpenCode Zen (pay-as-you-go) and OpenCode Go (subscription); get yours from https://opencode.ai |
 | `MIMO_API_KEY` | Xiaomi MiMo route | Xiaomi MiMo API key for `https://api.xiaomimimo.com/v1`; mirrored into the OpenAI-compatible auth env when the MiMo route is active |
 | `CLAUDE_CODE_USE_GEMINI` | Gemini only | Set to `1` to enable the direct Gemini provider path |
@@ -432,6 +464,65 @@ Model env vars are provider-scoped: first-party Anthropic sessions read
 `ANTHROPIC_MODEL`, OpenAI-compatible sessions read `OPENAI_MODEL`, Gemini reads
 `GEMINI_MODEL`, and Mistral reads `MISTRAL_MODEL`. For manual Bedrock, Vertex,
 or Foundry launches, select the model with `--model`.
+
+### Per-model limit overrides (`settings.json`)
+
+When a custom OpenAI-compatible provider does not expose context metadata from
+`/v1/models`, you can pin a model's context window and max output tokens. In
+addition to the `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` /
+`CLAUDE_CODE_OPENAI_MAX_OUTPUT_TOKENS` env vars above, you can set a
+`modelLimits` map in your `settings.json` (the same file `/config` writes, e.g.
+`~/.openclaude/settings.json`):
+
+```json
+{
+  "modelLimits": {
+    "my-custom-deployment": { "contextWindow": 262144, "maxOutputTokens": 32768 },
+    "api.private-llm.test:my-custom-deployment": { "contextWindow": 1000000 }
+  }
+}
+```
+
+- **Key matching** — keys match the model api-name exactly, or by prefix (e.g.
+  `my-custom` matches `my-custom-deployment-v2`). An **exact** key always wins
+  over a **prefix** key. A host-qualified key (`<host>:<model>`) only wins over a
+  bare key **within the same match kind** — a host-qualified exact key beats a
+  bare exact key, and a host-qualified prefix beats a bare prefix, but a bare
+  exact key still beats a host-qualified prefix. So to give the same model
+  different limits per endpoint, use host-qualified **exact** keys for each
+  endpoint. `<host>` is the `OPENAI_BASE_URL` host **including the port when the
+  URL has one** (`new URL(baseUrl).host`): for `http://localhost:4000/v1` the
+  key is `localhost:4000:my-model`, not `localhost:my-model`. Either field may be
+  omitted to override only one limit.
+- **Precedence** — from highest to lowest: an **exact** env-var override → the
+  built-in catalog value → the discovery-cache value → a **prefix** env-var
+  override → `modelLimits` → the descriptor default. (The built-in catalog is
+  checked before the discovery cache.) So env-var overrides always win over
+  `modelLimits`, and `modelLimits` mainly fills in models that have no built-in
+  metadata (a known catalog model keeps its catalog limit unless you set an
+  *exact* env override for it).
+
+## Safety strictness
+
+OpenClaude runs several "safety" checks: a model-level refusal directive, bash
+command-injection validation, and sensitive-file / auto-edit guards. These are
+conservative by design, but a few of them can surface as refusals or approval
+prompts for entirely benign, routine coding tasks (e.g. editing `.gitmodules`,
+running a build script that contains `$(date)`, or writing a CTF port scanner).
+See [issue #1616](https://github.com/Gitlawb/openclaude/issues/1616).
+
+Set `OPENCLAUDE_SAFETY_LEVEL` to dial strictness without changing behavior for
+everyone:
+
+| Value | Behavior |
+|-------|----------|
+| `strict` | Current/default-equivalent non-permissive behavior. |
+| `balanced` | Default. Same behavior as `strict`. |
+| `permissive` | Opt-in mode for users who prefer fewer false-positive stops. It bypasses the legacy bash command-injection validation path entirely, keeps ordinary interpreter allow-rules (`Bash(python:*)`, `Bash(npm run:*)`, …) when entering auto mode, and skips prompts for routine edits to filenames on the broad sensitive-file list. Dangerous directory, Windows-path, symlink-resolved path, and UNC guards remain active. The model-level prompt is not weakened by this flag. |
+
+```bash
+export OPENCLAUDE_SAFETY_LEVEL=permissive   # relax benign-task false positives
+```
 
 ## Runtime Hardening
 
@@ -594,21 +685,22 @@ would otherwise prevent it. Set `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP=0`
 only when you need to suppress that safety cap for diagnostics.
 
 If you frequently resume long sessions that accumulate hundreds of small
-tool-result messages with negligible token cost, you can opt in to message-count
+tool-result messages with negligible token cost, adjust message-count
 compaction via the in-app `/config` command:
 
 ```text
 /config
 ```
 
-Select **Message-count compaction** and choose a threshold (`100`, `200`, `500`,
-or `1000`). Setting it to `off` (default) leaves only the built-in hard cap.
+Message-count compaction defaults to `200` messages. Select
+**Message-count compaction** to choose a different threshold (`100`, `500`, or
+`1000`), or set it to `off` to disable the setting's proactive guard. The
+built-in hard cap remains, and an `OPENCLAUDE_MAX_ACTIVE_MESSAGES` override
+remains active when configured.
 
-This setting is intended for power users debugging specific edge cases. Most
-users should leave it at `off`.
-
-The legacy `OPENCLAUDE_MAX_ACTIVE_MESSAGES` environment variable is still
-honored when the setting is `off`. `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP`
+The legacy `OPENCLAUDE_MAX_ACTIVE_MESSAGES` environment variable is honored
+when the setting is unset or `off`. An explicit numeric setting takes
+precedence over that legacy value. `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP`
 can override the safety cap; set it to `0` only for diagnostics.
 
 ### Long-session memory guard validation

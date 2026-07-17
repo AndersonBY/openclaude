@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test, { afterEach, beforeEach } from 'node:test'
@@ -507,6 +507,121 @@ test('buildStartupEnvFromProfile preserves explicit OpenAI-compatible env withou
   assert.equal(isDefaultStartupProviderEnv(env), false)
 })
 
+test('buildStartupEnvFromProfile preserves concrete env-only NIM setup over stale profile', async () => {
+  const processEnv: NodeJS.ProcessEnv = {
+    OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+    OPENAI_MODEL: 'qwen/qwen3.5-397b-a17b',
+    NVIDIA_API_KEY: 'nvapi-live',
+    NVIDIA_NIM: '1',
+  }
+
+  const env = await buildStartupEnvFromProfile({
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+      OPENAI_MODEL: 'z-ai/glm-5.2',
+      NVIDIA_API_KEY: 'nvapi-stale',
+      NVIDIA_NIM: '1',
+    }),
+    processEnv,
+  })
+
+  assert.notEqual(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '1')
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, 'nvidia-nim')
+  assert.equal(env.OPENAI_MODEL, 'qwen/qwen3.5-397b-a17b')
+  assert.equal(env.OPENAI_BASE_URL, 'https://integrate.api.nvidia.com/v1')
+  assert.equal(env.NVIDIA_API_KEY, 'nvapi-live')
+  assert.equal(env.NVIDIA_NIM, '1')
+  assert.equal(resolveActiveRouteIdFromEnv(env), 'nvidia-nim')
+})
+
+test('buildStartupEnvFromProfile does not activate non-NIM env-only OpenAI-compatible setup', async () => {
+  const env = await buildStartupEnvFromProfile({
+    persisted: null,
+    processEnv: {
+      OPENAI_BASE_URL: 'https://openrouter.ai/api/v1',
+      OPENAI_MODEL: 'openrouter/zhipu/glm-5.2',
+      OPENAI_API_KEY: 'sk-live',
+    },
+  })
+
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '1')
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, undefined)
+  assert.equal(env.OPENAI_BASE_URL, 'https://opengateway.gitlawb.com/v1')
+  assert.equal(env.OPENAI_MODEL, 'mimo-v2.5-pro')
+  assert.equal(env.OPENAI_API_KEY, undefined)
+  assert.equal(resolveActiveRouteIdFromEnv(env), 'gitlawb-opengateway')
+  assert.equal(isDefaultStartupProviderEnv(env), true)
+})
+
+test('buildStartupEnvFromProfile documents no-flag Gemini env does not beat concrete NIM setup', async () => {
+  const processEnv = {
+    GEMINI_API_KEY: 'gemini-live',
+    GEMINI_MODEL: 'gemini-2.5-flash',
+    OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+    OPENAI_MODEL: 'qwen/qwen3.5-397b-a17b',
+    NVIDIA_API_KEY: 'nvapi-live',
+    NVIDIA_NIM: '1',
+  }
+
+  const env = await buildStartupEnvFromProfile({
+    persisted: null,
+    processEnv,
+  })
+
+  assert.notEqual(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '1')
+  assert.equal(env.CLAUDE_CODE_USE_GEMINI, undefined)
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, 'nvidia-nim')
+  assert.equal(env.GEMINI_API_KEY, undefined)
+  assert.equal(env.OPENAI_MODEL, 'qwen/qwen3.5-397b-a17b')
+  assert.equal(resolveActiveRouteIdFromEnv(env), 'nvidia-nim')
+})
+
+test('buildStartupEnvFromProfile preserves explicit OpenAI opt-out over concrete env-only NIM setup', async () => {
+  const processEnv: NodeJS.ProcessEnv = {
+    CLAUDE_CODE_USE_OPENAI: '0',
+    OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+    OPENAI_MODEL: 'qwen/qwen3.5-397b-a17b',
+    NVIDIA_API_KEY: 'nvapi-live',
+    NVIDIA_NIM: '1',
+  }
+
+  const env = await buildStartupEnvFromProfile({
+    persisted: null,
+    processEnv,
+  })
+
+  assert.equal(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '0')
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, undefined)
+  assert.equal(isDefaultStartupProviderEnv(env), false)
+})
+
+test('buildStartupEnvFromProfile preserves explicit Gemini selection over concrete env-only NIM setup', async () => {
+  const processEnv: NodeJS.ProcessEnv = {
+    CLAUDE_CODE_USE_GEMINI: '1',
+    GEMINI_API_KEY: 'gemini-live',
+    GEMINI_MODEL: 'gemini-2.5-flash',
+    OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+    OPENAI_MODEL: 'qwen/qwen3.5-397b-a17b',
+    NVIDIA_API_KEY: 'nvapi-live',
+    NVIDIA_NIM: '1',
+  }
+
+  const env = await buildStartupEnvFromProfile({
+    persisted: null,
+    processEnv,
+  })
+
+  assert.equal(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_GEMINI, '1')
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, undefined)
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, undefined)
+  assert.equal(resolveActiveRouteIdFromEnv(env), 'gemini')
+  assert.equal(isDefaultStartupProviderEnv(env), false)
+})
+
 test('buildStartupEnvFromProfile respects an explicit CLAUDE_CODE_USE_OPENAI=0 opt-out (issue #1245)', async () => {
   const env = await buildStartupEnvFromProfile({
     persisted: null,
@@ -996,6 +1111,29 @@ test('saveProfileFile writes a profile that loadProfileFile can read back', () =
   }
 })
 
+test('saveProfileFile restricts permissions when overwriting an existing profile', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'openclaude-profile-mode-'))
+
+  try {
+    const filePath = join(cwd, PROFILE_FILE_NAME)
+    writeFileSync(filePath, '{}', { encoding: 'utf8', mode: 0o644 })
+    chmodSync(filePath, 0o644)
+
+    saveProfileFile(
+      createProfileFile('anthropic', {
+        ANTHROPIC_AUTH_TOKEN: 'custom-bearer-token',
+      }),
+      { cwd },
+    )
+
+    if (process.platform !== 'win32') {
+      assert.equal(statSync(filePath).mode & 0o777, 0o600)
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
 test('saveProfileFile defaults to user config instead of the working directory', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-workspace-profile-'))
   const configRoot = mkdtempSync(join(tmpdir(), 'openclaude-config-profile-'))
@@ -1321,6 +1459,64 @@ test('buildStartupEnvFromProfile applies persisted gemini settings when no provi
   assert.equal(env.CLAUDE_CODE_USE_OPENAI, undefined)
   assert.equal(env.GEMINI_API_KEY, 'gem-test')
   assert.equal(env.GEMINI_MODEL, 'gemini-2.5-flash')
+})
+
+test('buildStartupEnvFromProfile restores a persisted custom Anthropic Bearer token', async () => {
+  const env = await buildStartupEnvFromProfile({
+    persisted: profile('anthropic', {
+      ANTHROPIC_BASE_URL: 'https://anthropic-proxy.example/v1',
+      ANTHROPIC_MODEL: 'claude-proxy-model',
+      ANTHROPIC_AUTH_TOKEN: 'persisted-proxy-token',
+      ANTHROPIC_CUSTOM_HEADERS: 'X-Tenant: example',
+    }),
+    processEnv: {},
+  })
+
+  assert.equal(env.ANTHROPIC_BASE_URL, 'https://anthropic-proxy.example/v1')
+  assert.equal(env.ANTHROPIC_MODEL, 'claude-proxy-model')
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'persisted-proxy-token')
+  assert.equal(env.ANTHROPIC_API_KEY, undefined)
+  assert.equal(env.ANTHROPIC_CUSTOM_HEADERS, 'X-Tenant: example')
+})
+
+test('buildStartupEnvFromProfile does not leak a stray API key into a persisted custom Anthropic Bearer profile', async () => {
+  const env = await buildStartupEnvFromProfile({
+    persisted: profile('anthropic', {
+      ANTHROPIC_BASE_URL: 'https://anthropic-proxy.example/v1',
+      ANTHROPIC_MODEL: 'claude-proxy-model',
+      ANTHROPIC_AUTH_TOKEN: 'persisted-proxy-token',
+    }),
+    processEnv: { ANTHROPIC_API_KEY: 'sk-ant-stray-shell-key' },
+  })
+
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'persisted-proxy-token')
+  assert.equal(env.ANTHROPIC_API_KEY, undefined)
+})
+
+test('buildStartupEnvFromProfile preserves explicit custom Anthropic environment setup', async () => {
+  const processEnv: NodeJS.ProcessEnv = {
+    ANTHROPIC_BASE_URL: 'https://anthropic-proxy.example/v1',
+    ANTHROPIC_MODEL: 'claude-proxy-model',
+    ANTHROPIC_AUTH_TOKEN: 'env-proxy-token',
+  }
+  const env = await buildStartupEnvFromProfile({ persisted: null, processEnv })
+
+  assert.equal(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, undefined)
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'env-proxy-token')
+})
+
+test('buildStartupEnvFromProfile preserves custom Anthropic x-api-key setup', async () => {
+  const processEnv: NodeJS.ProcessEnv = {
+    ANTHROPIC_BASE_URL: 'https://anthropic-proxy.example/v1',
+    ANTHROPIC_MODEL: 'claude-proxy-model',
+    ANTHROPIC_API_KEY: 'env-proxy-key',
+  }
+  const env = await buildStartupEnvFromProfile({ persisted: null, processEnv })
+
+  assert.equal(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, undefined)
+  assert.equal(env.ANTHROPIC_API_KEY, 'env-proxy-key')
 })
 
 test('buildStartupEnvFromProfile rehydrates stored Gemini access token for access-token profile mode', async () => {

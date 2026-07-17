@@ -19,6 +19,7 @@ const RESTORED_KEYS = [
   'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID',
   'CLAUDE_CODE_PROVIDER_ROUTE_ID',
   'CLAUDE_CONFIG_DIR',
+  'OPENCLAUDE_CONFIG_DIR',
   'CLAUDE_CODE_USE_OPENAI',
   'CLAUDE_CODE_USE_GEMINI',
   'CLAUDE_CODE_USE_MISTRAL',
@@ -45,6 +46,7 @@ const RESTORED_KEYS = [
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_MODEL',
   'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_CUSTOM_HEADERS',
   'ANTHROPIC_VERTEX_BASE_URL',
   'GEMINI_BASE_URL',
@@ -69,6 +71,7 @@ const RESTORED_KEYS = [
   'ATLAS_CLOUD_API_KEY',
   'CLINE_API_KEY',
   'HICAP_API_KEY',
+  'CLOUDFLARE_API_TOKEN',
   'CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS',
 ] as const
 
@@ -108,6 +111,7 @@ beforeEach(async () => {
   }
   testConfigDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
   process.env.CLAUDE_CONFIG_DIR = testConfigDir
+  process.env.OPENCLAUDE_CONFIG_DIR = testConfigDir
 })
 
 afterEach(() => {
@@ -267,6 +271,19 @@ function buildClinePassProfile(overrides: Partial<ProviderProfile> = {}): Provid
     baseUrl: 'https://api.cline.bot/api/v1',
     model: 'cline-pass/deepseek-v4-flash',
     apiKey: 'cline-test-key',
+    ...overrides,
+  })
+}
+
+function buildCloudflareProfile(overrides: Partial<ProviderProfile> = {}): ProviderProfile {
+  return buildProfile({
+    provider: 'cloudflare',
+    name: 'Cloudflare Workers AI',
+    // Account-scoped URL — users substitute `<ACCOUNT_ID>` for their account.
+    // Tests use a literal id so host-matching for the descriptor is exercised.
+    baseUrl: 'https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1',
+    model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    apiKey: 'cloudflare-test-token',
     ...overrides,
   })
 }
@@ -761,6 +778,133 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(process.env.OPENAI_API_KEY).toBe('atlas-test-key')
     expect(process.env.ATLAS_CLOUD_API_KEY).toBe('atlas-test-key')
     expect(getFreshAPIProvider()).toBe('openai')
+  })
+
+  test('cloudflare profile applies OpenAI-compatible env with CLOUDFLARE_API_TOKEN mirror', async () => {
+    // Account-scoped URL: a real user has substituted `<ACCOUNT_ID>` for their
+    // Cloudflare account id. The env-build path should mirror the api key into
+    // `CLOUDFLARE_API_TOKEN` so the descriptor's host-based route detection
+    // picks the cloudflare preset back up on the next reload.
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CLAUDE_CODE_USE_GEMINI = '1'
+
+    applyProviderProfileToProcessEnv(buildCloudflareProfile())
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.CLAUDE_CODE_USE_GEMINI).toBeUndefined()
+    expect(String(process.env.CLAUDE_CODE_USE_OPENAI)).toBe('1')
+    expect(process.env.OPENAI_BASE_URL).toBe(
+      'https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1',
+    )
+    expect(process.env.OPENAI_MODEL).toBe(
+      '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    )
+    expect(process.env.OPENAI_API_KEY).toBe('cloudflare-test-token')
+    expect(process.env.CLOUDFLARE_API_TOKEN).toBe('cloudflare-test-token')
+    expect(getFreshAPIProvider()).toBe('openai')
+  })
+
+  test('cloudflare profile retargeted to the shared AI Gateway host does not mirror CLOUDFLARE_API_TOKEN', async () => {
+    // gateway.ai.cloudflare.com is a shared AI Gateway host that fronts other
+    // providers (openai/anthropic/...). A cloudflare profile keeps
+    // routeId === 'cloudflare', but the token must NOT be mirrored when the
+    // base URL is the shared gateway, otherwise the profile stays tied to the
+    // cloudflare route through the descriptor's host-based detection.
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildCloudflareProfile({
+        baseUrl:
+          'https://gateway.ai.cloudflare.com/v1/abc123/my-gateway/openai',
+      }),
+    )
+
+    expect(process.env.CLOUDFLARE_API_TOKEN).toBeUndefined()
+    expect(process.env.OPENAI_API_KEY).toBe('cloudflare-test-token')
+  })
+
+  test('cloudflare profile retargeted off Workers AI keeps generic OpenAI-compatible capabilities', async () => {
+    // The Cloudflare route strips apiFormat/custom-auth/custom-header options
+    // (Workers AI has a fixed transport). Once the base URL is retargeted away
+    // from the real Workers AI endpoint, the runtime runs it as a generic
+    // OpenAI-compatible route, so profile capability resolution must fall back
+    // to the generic route and preserve those options instead of dropping them
+    // based on the stale cloudflare route id.
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildCloudflareProfile({
+        baseUrl:
+          'https://gateway.ai.cloudflare.com/v1/abc123/my-gateway/openai',
+        apiFormat: 'responses',
+      }),
+    )
+
+    // apiFormat survives because the retargeted profile resolves to a generic
+    // OpenAI-compatible route (which supports format selection), not cloudflare.
+    expect(process.env.OPENAI_API_FORMAT).toBe('responses')
+    // …and the Cloudflare token is still not mirrored to a non-Workers host.
+    expect(process.env.CLOUDFLARE_API_TOKEN).toBeUndefined()
+  })
+
+  test('cloudflare profile on a non-Workers api.cloudflare.com path does not mirror CLOUDFLARE_API_TOKEN', async () => {
+    // Same api.cloudflare.com host, but the REST management path — NOT Workers
+    // AI. The mirror is gated on the isCloudflareBaseUrl path predicate, so the
+    // token must not be attached to this non-Workers endpoint even though the
+    // host matches.
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildCloudflareProfile({
+        baseUrl: 'https://api.cloudflare.com/client/v4/user/tokens/verify',
+      }),
+    )
+
+    expect(process.env.CLOUDFLARE_API_TOKEN).toBeUndefined()
+    expect(process.env.OPENAI_API_KEY).toBe('cloudflare-test-token')
+  })
+
+  test('cloudflare profile on a non-Workers api.cloudflare.com path does not persist CLOUDFLARE_API_TOKEN', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const nonWorkersProfile = buildCloudflareProfile({
+        id: 'cloudflare_non_workers',
+        baseUrl: 'https://api.cloudflare.com/client/v4/user/tokens/verify',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [nonWorkersProfile],
+      }))
+
+      const result = setActiveProviderProfile('cloudflare_non_workers', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('cloudflare_non_workers')
+      // The base URL / key are still persisted, but the dedicated Workers AI
+      // token must not be, since this is not a Workers AI endpoint.
+      expect(persisted.env.OPENAI_API_KEY).toBe('cloudflare-test-token')
+      expect(persisted.env.CLOUDFLARE_API_TOKEN).toBeUndefined()
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
   })
 
   test('xiaomi mimo profile normalizes stale docs endpoint to resolving API host', async () => {
@@ -2113,6 +2257,20 @@ describe('getProviderPresetDefaults', () => {
 
     expect(defaults.apiKey).toBe('key-a,key-b')
   })
+
+  test('custom Anthropic preserves direct endpoint settings but only hydrates a Bearer token', async () => {
+    const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
+    process.env.ANTHROPIC_BASE_URL = 'https://tenant.example/v1'
+    process.env.ANTHROPIC_MODEL = 'tenant-model'
+    process.env.ANTHROPIC_AUTH_TOKEN = 'bearer-token'
+    process.env.ANTHROPIC_API_KEY = 'native-api-key'
+
+    const defaults = getProviderPresetDefaults('custom-anthropic')
+
+    expect(defaults.baseUrl).toBe('https://tenant.example/v1')
+    expect(defaults.model).toBe('tenant-model')
+    expect(defaults.apiKey).toBe('bearer-token')
+  })
   test('ollama preset defaults to a local Ollama model', async () => {
     const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
     delete process.env.OPENAI_MODEL
@@ -2751,6 +2909,48 @@ describe('setActiveProviderProfile', () => {
     }
   })
 
+  test('persists Cloudflare profiles with CLOUDFLARE_API_TOKEN in the strict startup env', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const cloudflareProfile = buildCloudflareProfile({ id: 'cloudflare_prof' })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [cloudflareProfile],
+      }))
+
+      const result = setActiveProviderProfile('cloudflare_prof', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('cloudflare_prof')
+      expect(persisted.profile).toBe('openai')
+      // The strict startup-env branch (keyed profile) must mirror the dedicated
+      // token, otherwise a relaunched Cloudflare profile persists an env that
+      // omits CLOUDFLARE_API_TOKEN and re-detects inconsistently.
+      expect(persisted.env).toEqual({
+        OPENAI_BASE_URL:
+          'https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1',
+        OPENAI_MODEL: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+        OPENAI_API_KEY: 'cloudflare-test-token',
+        CLOUDFLARE_API_TOKEN: 'cloudflare-test-token',
+      })
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
   test('persists Xiaomi MiMo profiles using a legacy-compatible openai startup profile', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
     const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
@@ -3053,6 +3253,44 @@ describe('setActiveProviderProfile', () => {
     }
   })
 
+  test('persists custom Anthropic-compatible profiles with Bearer token auth', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } = await importFreshProviderProfileModules()
+      const profile = buildProfile({
+        id: 'custom_anthropic_prof',
+        name: 'Custom Anthropic',
+        provider: 'custom-anthropic',
+        baseUrl: 'https://anthropic-proxy.example',
+        model: 'claude-proxy-model',
+        apiKey: 'proxy-token',
+      })
+      saveMockGlobalConfig(current => ({ ...current, providerProfiles: [profile] }))
+
+      const result = setActiveProviderProfile('custom_anthropic_prof', { configDir })
+      const persisted = JSON.parse(readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'))
+
+      expect(result?.id).toBe('custom_anthropic_prof')
+      expect(process.env.ANTHROPIC_BASE_URL).toBe('https://anthropic-proxy.example')
+      expect(process.env.ANTHROPIC_MODEL).toBe('claude-proxy-model')
+      expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe('proxy-token')
+      expect(process.env.ANTHROPIC_API_KEY).toBeUndefined()
+      expect(persisted.env).toEqual({
+        ANTHROPIC_BASE_URL: 'https://anthropic-proxy.example',
+        ANTHROPIC_MODEL: 'claude-proxy-model',
+        ANTHROPIC_AUTH_TOKEN: 'proxy-token',
+      })
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
   test('sets ANTHROPIC_MODEL env var when switching to an anthropic-type provider', async () => {
     const { setActiveProviderProfile } =
       await importFreshProviderProfileModules()
@@ -3258,6 +3496,101 @@ describe('deleteProviderProfile', () => {
     expect(process.env.ANTHROPIC_BASE_URL).toBeUndefined()
     expect(process.env.ANTHROPIC_MODEL).toBeUndefined()
     expect(process.env.ANTHROPIC_API_KEY).toBeUndefined()
+  })
+
+  test('deleting the active custom Anthropic profile removes its startup mirror', async () => {
+    const {
+      deleteProviderProfile,
+      setActiveProviderProfile,
+    } = await importFreshProviderProfileModules()
+    const profile = buildProfile({
+      id: 'custom_anthropic_profile',
+      provider: 'custom-anthropic',
+      baseUrl: 'https://proxy.example',
+      model: 'proxy-model',
+      apiKey: 'bearer-token',
+    })
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [profile],
+      activeProviderProfileId: profile.id,
+    }))
+
+    setActiveProviderProfile(profile.id, { configDir: testConfigDir ?? undefined })
+    const profilePath = join(testConfigDir!, '.openclaude-profile.json')
+    expect(existsSync(profilePath)).toBe(true)
+
+    deleteProviderProfile(profile.id)
+
+    expect(existsSync(profilePath)).toBe(false)
+  })
+
+  test('updating the active custom Anthropic profile synchronizes its startup mirror', async () => {
+    const { setActiveProviderProfile, updateProviderProfile } =
+      await importFreshProviderProfileModules()
+    const profile = buildProfile({
+      id: 'custom_anthropic_profile',
+      provider: 'custom-anthropic',
+      baseUrl: 'https://proxy.example',
+      model: 'proxy-model',
+      apiKey: 'old-token',
+    })
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [profile],
+      activeProviderProfileId: profile.id,
+    }))
+
+    setActiveProviderProfile(profile.id, { configDir: testConfigDir ?? undefined })
+    updateProviderProfile(profile.id, {
+      ...profile,
+      baseUrl: 'https://new-proxy.example',
+      model: 'new-proxy-model',
+      apiKey: 'new-token',
+    })
+
+    const persisted = JSON.parse(
+      readFileSync(join(testConfigDir!, '.openclaude-profile.json'), 'utf8'),
+    )
+    expect(persisted.env.ANTHROPIC_BASE_URL).toBe('https://new-proxy.example')
+    expect(persisted.env.ANTHROPIC_MODEL).toBe('new-proxy-model')
+    expect(persisted.env.ANTHROPIC_AUTH_TOKEN).toBe('new-token')
+  })
+
+  test('deleting an active custom Anthropic profile persists its replacement', async () => {
+    const { deleteProviderProfile, setActiveProviderProfile } =
+      await importFreshProviderProfileModules()
+    const activeProfile = buildProfile({
+      id: 'custom_anthropic_profile',
+      provider: 'custom-anthropic',
+      baseUrl: 'https://proxy.example',
+      model: 'proxy-model',
+      apiKey: 'bearer-token',
+    })
+    const replacement = buildProfile({
+      id: 'replacement_profile',
+      baseUrl: 'https://replacement.example/v1',
+      model: 'replacement-model',
+      apiKey: 'replacement-token',
+    })
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [activeProfile, replacement],
+      activeProviderProfileId: activeProfile.id,
+    }))
+
+    setActiveProviderProfile(activeProfile.id, {
+      configDir: testConfigDir ?? undefined,
+    })
+    deleteProviderProfile(activeProfile.id)
+
+    const persisted = JSON.parse(
+      readFileSync(join(testConfigDir!, '.openclaude-profile.json'), 'utf8'),
+    )
+    expect(persisted.profile).toBe('openai')
+    expect(persisted.env.OPENAI_BASE_URL).toBe('https://replacement.example/v1')
+    expect(persisted.env.OPENAI_MODEL).toBe('replacement-model')
+    expect(persisted.env.OPENAI_API_KEY).toBe('replacement-token')
   })
 
   test('deleting final profile preserves explicit startup provider env', async () => {

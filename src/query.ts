@@ -74,7 +74,9 @@ import {
   startRelevantMemoryPrefetch,
 } from './utils/attachments.js'
 import {
+  getMaxActiveMessagesHardCap,
   isAboveMaxActiveMessagesLimit,
+  parseMaxActiveMessagesLimit,
   resolveMaxActiveMessagesLimit,
 } from './utils/maxActiveMessages.js'
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -125,7 +127,9 @@ import {
 import { AGENT_STEP_LIMIT_TOOL_RESULT_PREFIX } from './query/agentStepLimit.js'
 import { buildQueryConfig } from './query/config.js'
 import {
+  MAX_MESSAGES_COMPACTION_THRESHOLDS,
   getGlobalConfig,
+  isValidMaxMessagesCompactionThreshold,
   normalizeMaxMessagesCompactionThreshold,
 } from './utils/config.js'
 import { productionDeps, type QueryDeps } from './query/deps.js'
@@ -568,6 +572,10 @@ async function* queryLoop(
   // trigger point. Loop-local (not on State) to avoid touching the 7 continue
   // sites.
   let taskBudgetRemaining: number | undefined = undefined
+  let pendingToolFailureAdvisories: {
+    message: ReturnType<typeof createUserMessage>
+    threshold: number
+  }[] = []
   // Smart-routing decision, pinned once per user turn (transition===undefined)
   // and reused on every continuation pass. Loop-local (not on State) so it
   // survives the State rebuilds at the continue sites for free — mirrors
@@ -663,6 +671,11 @@ async function* queryLoop(
     }
 
     let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]
+    if (pendingToolFailureAdvisories.length > 0) {
+      messagesForQuery.push(
+        ...pendingToolFailureAdvisories.map(advisory => advisory.message),
+      )
+    }
 
     // Extract facts and update phase from the latest message (user input or tool result)
     if (
@@ -804,18 +817,39 @@ async function* queryLoop(
     // compaction and forcing would deadlock via recursive autocompaction.
     const canForceCompact =
       querySource !== 'compact' && querySource !== 'session_memory'
+    // An unset UI setting keeps the legacy environment override. Without that
+    // override, enforce the new effective 200-message default.
+    const hasValidLegacyActiveMessageLimit =
+      parseMaxActiveMessagesLimit(process.env.OPENCLAUDE_MAX_ACTIVE_MESSAGES) > 0
+    const maxMessagesLimitSetting =
+      configuredMaxMessagesCompactionThreshold === undefined &&
+      hasValidLegacyActiveMessageLimit
+        ? undefined
+        : maxMessagesCompactionThreshold
+    const hasExplicitMessageCountThreshold =
+      configuredMaxMessagesCompactionThreshold !== undefined &&
+      isValidMaxMessagesCompactionThreshold(configuredMaxMessagesCompactionThreshold) &&
+      configuredMaxMessagesCompactionThreshold !== 'off'
+    const hasActiveMessageLimitOverride =
+      hasExplicitMessageCountThreshold ||
+      ((configuredMaxMessagesCompactionThreshold === undefined ||
+        configuredMaxMessagesCompactionThreshold === 'off') &&
+        hasValidLegacyActiveMessageLimit)
     const activeMessageLimit = canForceCompact
       ? resolveMaxActiveMessagesLimit(
-          maxMessagesCompactionThreshold,
+          maxMessagesLimitSetting,
           process.env.OPENCLAUDE_MAX_ACTIVE_MESSAGES,
         )
       : 0
     if (canForceCompact) {
       if (
-        isAboveMaxActiveMessagesLimit(
-          messagesForQuery.length,
-          activeMessageLimit,
-        )
+        isAboveMaxActiveMessagesLimit(messagesForQuery.length, activeMessageLimit) &&
+        (isAutoCompactEnabled() ||
+          hasActiveMessageLimitOverride ||
+          isAboveMaxActiveMessagesLimit(
+            messagesForQuery.length,
+            getMaxActiveMessagesHardCap(),
+          ))
       ) {
         tracking = {
           ...(tracking ?? { compacted: false, turnId: '', turnCounter: 0 }),
@@ -924,7 +958,17 @@ async function* queryLoop(
       }
 
       // Continue on with the current query call using the post compact messages
-      messagesForQuery = messagesAfterCompact
+      messagesForQuery = [
+        ...messagesAfterCompact,
+        ...pendingToolFailureAdvisories
+          .filter(
+            advisory =>
+              !messagesAfterCompact.some(
+                message => message.uuid === advisory.message.uuid,
+              ),
+          )
+          .map(advisory => advisory.message),
+      ]
     } else if (
       consecutiveFailures !== undefined ||
       nextRetryAtMs !== undefined ||
@@ -1148,6 +1192,14 @@ async function* queryLoop(
     // cooling down or otherwise exhausted and context or message count is still
     // over the safety threshold, block immediately with a clear message instead
     // of burning an oversized API call.
+    const isAboveActiveMessageHardCap = isAboveMaxActiveMessagesLimit(
+      messagesForQuery.length,
+      getMaxActiveMessagesHardCap(),
+    )
+    const shouldEnforceActiveMessageLimit =
+      (!collapseOwnsIt && isAutoCompactEnabled()) ||
+      hasActiveMessageLimitOverride ||
+      isAboveActiveMessageHardCap
     if (
       tracking?.consecutiveFailures !== undefined &&
       tracking.consecutiveFailures >=
@@ -1162,14 +1214,16 @@ async function* queryLoop(
         tokenUsage,
         model,
       )
+      const isAboveActiveMessageSafetyLimit =
+        isAboveMaxActiveMessagesLimit(
+          messagesForQuery.length,
+          activeMessageLimit,
+        ) && shouldEnforceActiveMessageLimit
       const isAboveBreakerThreshold =
         isAboveAutoCompactThreshold ||
         ((circuitBreakerActive === true || circuitBreakerTripped === true) &&
           tokenUsage >= getAutoCompactThreshold(model)) ||
-        isAboveMaxActiveMessagesLimit(
-          messagesForQuery.length,
-          activeMessageLimit,
-        )
+        isAboveActiveMessageSafetyLimit
       if (isAboveBreakerThreshold) {
         const nowMs = Date.now()
         const retryDelayMs =
@@ -1192,7 +1246,11 @@ async function* queryLoop(
     }
 
     if (
-      isAboveMaxActiveMessagesLimit(messagesForQuery.length, activeMessageLimit)
+      shouldEnforceActiveMessageLimit &&
+      isAboveMaxActiveMessagesLimit(
+        messagesForQuery.length,
+        activeMessageLimit,
+      )
     ) {
       yield createAssistantAPIErrorMessage({
         content:
@@ -1206,6 +1264,21 @@ async function* queryLoop(
     const toolsForModel = agentStepLimit?.summaryRequested
       ? []
       : toolUseContext.options.tools
+    // The blocking-limit returns above are terminal, so an advisory cannot be
+    // surfaced or retained for a later model turn on those paths.
+    const advisoriesForCurrentRequest = pendingToolFailureAdvisories
+    for (const advisory of advisoriesForCurrentRequest) {
+      logForDebugging(
+        `Tool failure loop guard advisory: threshold=${advisory.threshold} hasToolName=true hasErrorCategory=true`,
+      )
+      logEvent('tengu_tool_failure_loop_guard_advisory', {
+        threshold: advisory.threshold,
+        hasToolName: true,
+        hasErrorCategory: true,
+        queryDepth: queryTracking.depth,
+      })
+    }
+    pendingToolFailureAdvisories = []
     // Once-only guard for the smart-routing routed-error fallback (U4): a
     // simple-routed call that errors retries once on the strong model; a second
     // failure propagates normally rather than re-routing. Intentionally scoped
@@ -1811,12 +1884,23 @@ async function* queryLoop(
           }
 
           const postCompactMessages = buildPostCompactMessages(compacted)
+          const messagesAfterCompact = [
+            ...postCompactMessages,
+            ...advisoriesForCurrentRequest
+              .filter(
+                advisory =>
+                  !postCompactMessages.some(
+                    message => message.uuid === advisory.message.uuid,
+                  ),
+              )
+              .map(advisory => advisory.message),
+          ]
           for (const msg of postCompactMessages) {
             yield msg
           }
           updateAutoCompactTracking(undefined)
           const next: State = {
-            messages: postCompactMessages,
+            messages: messagesAfterCompact,
             toolUseContext,
             autoCompactTracking: undefined,
             maxOutputTokensRecoveryCount,
@@ -2801,6 +2885,18 @@ async function* queryLoop(
         turnCount: nextTurnCount,
       })
       return { reason: 'max_turns', turnCount: nextTurnCount }
+    }
+
+    if (!nextAgentStepLimit?.summaryRequested) {
+      pendingToolFailureAdvisories = (
+        toolFailureLoopDecision.advisories ?? []
+      ).map(advisoryDecision => ({
+        message: createUserMessage({
+          content: advisoryDecision.message,
+          isMeta: true,
+        }),
+        threshold: advisoryDecision.threshold,
+      }))
     }
 
     queryCheckpoint('query_recursive_call')

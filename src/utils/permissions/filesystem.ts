@@ -15,12 +15,17 @@ import type { z } from 'zod/v4'
 import { getOriginalCwd, getSessionId } from '../../bootstrap/state.js'
 import { PRODUCT_DISPLAY_NAME } from '../../constants/product.js'
 import { checkStatsigFeatureGate_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
-import type { AnyObject, Tool, ToolPermissionContext } from '../../Tool.js'
+import type {
+  AnyObject,
+  Tool,
+  ToolPermissionContext,
+  ToolUseContext,
+} from '../../Tool.js'
 import { FILE_READ_TOOL_NAME } from '../../tools/FileReadTool/prompt.js'
 import { getCwd } from '../cwd.js'
 import { logForDebugging } from '../debug.js'
 import { getClaudeConfigHomeDir } from '../envUtils.js'
-import { isFsInaccessible } from '../errors.js'
+import { isENOENT, isFsInaccessible } from '../errors.js'
 import { isMemoryWriteApprovalRequired } from '../governancePolicy.js'
 import {
   getFsImplementation,
@@ -51,6 +56,7 @@ import type { PermissionRule, PermissionRuleSource } from './PermissionRule.js'
 import { createReadRuleSuggestion } from './PermissionUpdate.js'
 import type { PermissionUpdate } from './PermissionUpdateSchema.js'
 import { getRuleByContentsForToolName } from './permissions.js'
+import { isPermissiveSafety } from './safetyLevel.js'
 
 declare const MACRO: { VERSION: string }
 
@@ -483,6 +489,58 @@ function pathsEqualForPermission(a: string, b: string): boolean {
     normalizeCaseForComparison(normalize(b))
 }
 
+function pathsEqualForActivePlan(a: string, b: string): boolean {
+  const normalizedA = normalize(a)
+  const normalizedB = normalize(b)
+  return normalizedA === normalizedB
+}
+
+/**
+ * Whether a path resolves exactly to the active plan file for this execution
+ * context. Unlike isSessionPlanFile(), this deliberately does not accept other
+ * agent plan files or files that merely share the current plan slug prefix.
+ */
+export function isActiveSessionPlanFile(
+  path: string,
+  agentId?: ToolUseContext['agentId'],
+): boolean {
+  try {
+    const activePlanPath = getActiveSessionPlanFilePath(agentId)
+    try {
+      const activePlanStats = getFsImplementation().lstatSync(activePlanPath)
+      if (activePlanStats.isSymbolicLink() || !activePlanStats.isFile()) {
+        return false
+      }
+    } catch (error) {
+      if (!isENOENT(error)) return false
+    }
+
+    const expectedForms = getPathsForPermissionCheck(activePlanPath)
+    const targetForms = getPathsForPermissionCheck(expandPath(path))
+
+    return (
+      targetForms.length > 0 &&
+      targetForms.every(target =>
+        expectedForms.some(expected => pathsEqualForActivePlan(target, expected)),
+      )
+    )
+  } catch {
+    return false
+  }
+}
+
+export function getActiveSessionPlanFilePath(
+  agentId?: ToolUseContext['agentId'],
+): string {
+  // Lazy import keeps the permission/filesystem cycle safe and ensures test
+  // harnesses that temporarily replace the plan provider cannot leave a stale
+  // function captured in this module.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { getPlanFilePath } =
+    require('../plans.js') as typeof import('../plans.js')
+  return getPlanFilePath(agentId)
+}
+
 export function isOpenClaudeCommitMessagePath(absolutePath: string): boolean {
   const expectedPath = join(getOriginalCwd(), '.git', 'OPENCLAUDE_COMMIT_MSG')
   const expectedForms = getPathsForPermissionCheck(expectedPath)
@@ -505,7 +563,10 @@ export function isOpenClaudeCommitMessagePath(absolutePath: string): boolean {
  * - Shell configuration files (to prevent shell startup script manipulation)
  * - UNC paths (to prevent network file access and WebDAV attacks)
  */
-function isDangerousFilePathToAutoEdit(path: string): boolean {
+function isDangerousFilePathToAutoEdit(
+  path: string,
+  { skipConfigFileList = false }: { skipConfigFileList?: boolean } = {},
+): boolean {
   const absolutePath = expandPath(path)
   const pathSegments = absolutePath.split(sep)
   const fileName = pathSegments.at(-1)
@@ -545,7 +606,7 @@ function isDangerousFilePathToAutoEdit(path: string): boolean {
   }
 
   // Check for dangerous configuration files (case-insensitive)
-  if (fileName) {
+  if (!skipConfigFileList && fileName) {
     const normalizedFileName = normalizeCaseForComparison(fileName)
     if (
       (DANGEROUS_FILES as readonly string[]).some(
@@ -722,9 +783,13 @@ export function checkPathSafetyForAutoEdit(
     }
   }
 
-  // Check for dangerous files on all paths
+  // Check for dangerous files on all paths. In permissive safety mode
+  // (OPENCLAUDE_SAFETY_LEVEL=permissive) we skip only the filename list that
+  // can prompt on routine edits like .gitmodules, shell rc files, or .mcp.json.
+  // Directory, UNC, symlink-resolved, and Windows path guards remain active.
+  const skipConfigFileList = isPermissiveSafety()
   for (const pathToCheck of pathsToCheck) {
-    if (isDangerousFilePathToAutoEdit(pathToCheck)) {
+    if (isDangerousFilePathToAutoEdit(pathToCheck, { skipConfigFileList })) {
       return {
         safe: false,
         message: `${PRODUCT_DISPLAY_NAME} requested permissions to edit ${path} which is a sensitive file.`,
@@ -1111,7 +1176,11 @@ export function checkReadPermissionForTool(
       message: `${PRODUCT_DISPLAY_NAME} requested permissions to use ${tool.name}, but you haven't granted it yet.`,
     }
   }
-  const path = tool.getPath(input)
+  // Tool inputs may be relative to the session CWD, which can differ from the
+  // process CWD for bridged or scoped sessions. Resolve before gathering
+  // symlink variants so every permission check uses the same session-relative
+  // absolute path.
+  const path = expandPath(tool.getPath(input))
 
   // Get paths to check (includes both original and resolved symlinks).
   // Computed once here and threaded through checkWritePermissionForTool →
@@ -1270,10 +1339,10 @@ export function checkReadPermissionForTool(
  * Permission result for write permission for the specified tool & tool input.
  *
  * @param precomputedPathsToCheck - Optional cached result of
- *   `getPathsForPermissionCheck(tool.getPath(input))`. Callers MUST derive this
- *   from the same `tool` and `input` in the same synchronous frame — `path` is
- *   re-derived internally for error messages and internal-path checks, so a
- *   stale value would silently check deny rules for the wrong path.
+ *   `getPathsForPermissionCheck(expandPath(tool.getPath(input)))`. Callers MUST
+ *   derive this from the same `tool` and `input` in the same synchronous frame
+ *   — `path` is re-derived internally for error messages and internal-path
+ *   checks, so a stale value would silently check deny rules for the wrong path.
  */
 export function checkWritePermissionForTool<Input extends AnyObject>(
   tool: Tool<Input>,
@@ -1287,7 +1356,11 @@ export function checkWritePermissionForTool<Input extends AnyObject>(
       message: `${PRODUCT_DISPLAY_NAME} requested permissions to use ${tool.name}, but you haven't granted it yet.`,
     }
   }
-  const path = tool.getPath(input)
+  // Tool inputs may be relative to the session CWD, which can differ from the
+  // process CWD for bridged or scoped sessions. Resolve before gathering
+  // symlink variants so every permission check uses the same session-relative
+  // absolute path.
+  const path = expandPath(tool.getPath(input))
 
   // 1. Check for deny rules - check both the original path and resolved symlink path
   const pathsToCheck =

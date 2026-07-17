@@ -364,6 +364,47 @@ export function hasMistralApiHost(baseUrl: string | undefined): boolean {
   }
 }
 
+function hasNvidiaNimApiHost(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+
+  try {
+    return new URL(baseUrl).hostname.toLowerCase() === 'integrate.api.nvidia.com'
+  } catch {
+    return false
+  }
+}
+
+function setNvidiaNimChatTemplateThinking(body: Record<string, unknown>): void {
+  const existing = body.chat_template_kwargs
+  const kwargs =
+    existing && typeof existing === 'object' && !Array.isArray(existing)
+      ? { ...(existing as Record<string, unknown>) }
+      : {}
+
+  kwargs.thinking = true
+  kwargs.enable_thinking = true
+  body.chat_template_kwargs = kwargs
+}
+
+function maybeSetNvidiaNimChatTemplateThinking(
+  body: Record<string, unknown>,
+  baseUrl: string | undefined,
+  reasoningRequestPlan: {
+    thinkingType?: string
+    reasoningEffort?: string
+  },
+): void {
+  if (!hasNvidiaNimApiHost(baseUrl)) return
+  if (
+    reasoningRequestPlan.thinkingType !== 'enabled' &&
+    !reasoningRequestPlan.reasoningEffort
+  ) {
+    return
+  }
+
+  setNvidiaNimChatTemplateThinking(body)
+}
+
 function formatRetryAfterHint(response: Response): string {
   const ra = response.headers.get('retry-after')
   return ra ? ` (Retry-After: ${ra})` : ''
@@ -1776,26 +1817,38 @@ export function parseTextToolCalls(text: string): {
 // ---------------------------------------------------------------------------
 // XML tool call parser (GLM / Qwen / DeepSeek family)
 //
-// Several open models routed through OpenAI-compatible gateways emit tool
-// calls as XML text inside the assistant message rather than as structured
-// `tool_calls`. Without recovery these leak into visible prose and never
-// execute — the turn then ends with no tool_use block, so the agent appears
-// to "forget" and stop mid-task. We support the three dialects seen in the
-// wild:
+// Several models routed through OpenAI-compatible gateways emit tool calls as
+// XML text inside the assistant message rather than as structured `tool_calls`.
+// Without recovery these leak into visible prose and never execute — the turn
+// then ends with no tool_use block, so the agent appears to "forget" and stop
+// mid-task. We support the four dialects seen in the wild:
 //   A. <tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>
 //   B. <tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>…</tool_call>  (GLM native)
 //   C. <tool_call>{"name":"NAME","arguments":{…}}</tool_call>                          (Hermes JSON)
+//   D. <tool_calls:ID><tool_call:ID>NAME<parameter name="KEY">VALUE</parameter>…           (Tencent HY3)
 // ---------------------------------------------------------------------------
 
 // The streaming finalize path buffers from this opener onward so the raw XML
 // is never surfaced as text before extraction.
 const XML_TOOL_CALL_OPEN = '<tool_call>'
+const HY3_TOOL_CALLS_OPEN = '<tool_calls:'
+const HY3_TOOL_CALL_OPEN = '<tool_call:'
+const XML_TOOL_CALL_OPENERS = [
+  XML_TOOL_CALL_OPEN,
+  HY3_TOOL_CALLS_OPEN,
+  HY3_TOOL_CALL_OPEN,
+]
 // Non-greedy block matcher; the `$` alternative tolerates a truncated final
 // block (stream cut off before the closing tag).
 const XML_TOOL_CALL_BLOCK_RE = /<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g
+const HY3_TOOL_CALLS_BLOCK_RE = /<tool_calls:[^>\s]+>([\s\S]*?)(?:<\/tool_calls(?::[^>\s]+)?>|$)/g
+const HY3_TOOL_CALL_BLOCK_RE = /<tool_call:[^>\s]+>([\s\S]*?)(?:<\/tool_call(?::[^>\s]+)?>|$)/g
 const XML_FUNCTION_NAME_RE = /<function=([^>\s]+)\s*>/
 const XML_PARAMETER_RE = /<parameter=([^>\s]+)\s*>([\s\S]*?)<\/parameter>/g
 const XML_ARG_PAIR_RE = /<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g
+const HY3_PARAMETER_RE = /<parameter\s+name=["']([^"'>\s]+)["']\s*>([\s\S]*?)<\/parameter>/g
+const HY3_NAMED_ARGUMENT_LINE_RE = /^\s*([A-Za-z_][\w-]*)\s*:\s*(.+?)\s*$/gm
+const HY3_ARG_PAIR_RE = /<arg_key(?::[^>\s]+)?>([\s\S]*?)<\/arg_key(?::[^>\s]+)?>\s*<arg_value(?::[^>\s]+)?>([\s\S]*?)<\/arg_value(?::[^>\s]+)?>/g
 
 // Parameter/arg values arrive as untyped text. Try JSON first so numbers,
 // booleans, and nested objects round-trip; fall back to the raw string.
@@ -1809,27 +1862,135 @@ function coerceXmlToolValue(raw: string): unknown {
   }
 }
 
+function parseHy3ToolCallInner(inner: string): {
+  name?: string
+  args: Record<string, unknown>
+} {
+  const args: Record<string, unknown> = {}
+  const trimmed = inner.trim()
+  const name = trimmed
+    .split(/[\n<]/, 1)[0]
+    ?.trim()
+    .replace(/[\s`*_]+$/, '')
+  let hasStructuredArguments = false
+
+  for (const parameter of inner.matchAll(HY3_PARAMETER_RE)) {
+    const key = parameter[1]
+    if (key) {
+      hasStructuredArguments = true
+      args[key] = coerceXmlToolValue(parameter[2] ?? '')
+    }
+  }
+  for (const line of inner.matchAll(HY3_NAMED_ARGUMENT_LINE_RE)) {
+    const key = line[1]
+    if (key) {
+      hasStructuredArguments = true
+      args[key] = coerceXmlToolValue(line[2] ?? '')
+    }
+  }
+  for (const pair of inner.matchAll(HY3_ARG_PAIR_RE)) {
+    const key = pair[1]?.trim()
+    if (key) {
+      hasStructuredArguments = true
+      args[key] = coerceXmlToolValue(pair[2] ?? '')
+    }
+  }
+
+  // The provider's textual wrapper is not self-authenticating. Requiring a
+  // normal tool identifier avoids executing or hiding documentation snippets
+  // that merely demonstrate `<tool_call:...>`, while still allowing every
+  // valid zero-input tool instead of maintaining a stale name allowlist.
+  return {
+    name: name && /^[A-Za-z_][\w.-]*$/.test(name) &&
+      (hasStructuredArguments || trimmed === name)
+      ? name
+      : undefined,
+    args,
+  }
+}
+
+function isHy3Model(model: string): boolean {
+  return model.split('?', 1)[0]?.toLowerCase() === 'tencent/hy3'
+}
+
 /**
  * Returns the length of the longest suffix of `s` that is a (proper) prefix of
  * the `<tool_call>` opener. Used by the stream to hold back a trailing partial
  * opener split across SSE deltas so it is never emitted as visible text.
  */
-function trailingXmlOpenerPrefixLen(s: string): number {
-  const max = Math.min(s.length, XML_TOOL_CALL_OPEN.length - 1)
-  for (let len = max; len > 0; len--) {
-    if (XML_TOOL_CALL_OPEN.startsWith(s.slice(s.length - len))) return len
+function trailingXmlOpenerPrefixLen(s: string, allowHy3: boolean): number {
+  let longest = 0
+  const openers = allowHy3 ? XML_TOOL_CALL_OPENERS : [XML_TOOL_CALL_OPEN]
+  for (const opener of openers) {
+    const max = Math.min(s.length, opener.length - 1)
+    for (let len = max; len > 0; len--) {
+      if (opener.startsWith(s.slice(s.length - len))) {
+        longest = Math.max(longest, len)
+        break
+      }
+    }
   }
-  return 0
+  return longest
+}
+
+function findXmlToolCallOpener(text: string, allowHy3: boolean): number {
+  const openers = allowHy3 ? XML_TOOL_CALL_OPENERS : [XML_TOOL_CALL_OPEN]
+  return openers.reduce((first, opener) => {
+    const index = text.indexOf(opener)
+    return index === -1 ? first : first === -1 ? index : Math.min(first, index)
+  }, -1)
 }
 
 /** Exported for unit testing only. */
-export function parseXmlToolCalls(text: string): {
+export function parseXmlToolCalls(text: string, allowHy3 = false): {
   calls: ParsedTextToolCall[]
   toolCallRanges: Array<[number, number]>
 } {
   const results: ParsedTextToolCall[] = []
   const seen = new Set<string>()
   const ranges: Array<[number, number]> = []
+
+  const addCall = (name: string, args: Record<string, unknown>) => {
+    const dedupKey = `${name}:${JSON.stringify(args)}`
+    if (seen.has(dedupKey)) return
+    seen.add(dedupKey)
+    results.push({ id: `xml_tc_${++_textToolCallCounter}`, name, arguments: args })
+  }
+
+  const hy3Blocks = allowHy3
+    ? [...text.matchAll(HY3_TOOL_CALL_BLOCK_RE)].map(block => ({
+      range: [block.index!, block.index! + block[0].length] as [number, number],
+      parsed: parseHy3ToolCallInner(block[1] ?? ''),
+    }))
+    : []
+  const hy3WrapperRanges = allowHy3
+    ? [...text.matchAll(HY3_TOOL_CALLS_BLOCK_RE)]
+      .filter(wrapper => {
+        const range: [number, number] = [
+          wrapper.index!,
+          wrapper.index! + wrapper[0].length,
+        ]
+        return hy3Blocks.some(
+          block => block.parsed.name && range[0] <= block.range[0] && block.range[1] <= range[1],
+        )
+      })
+      .map(wrapper => [
+        wrapper.index!,
+        wrapper.index! + wrapper[0].length,
+      ] as [number, number])
+    : []
+
+  for (const block of hy3Blocks) {
+    const { name, args } = block.parsed
+    if (!name) continue
+    const range = block.range
+    if (!hy3WrapperRanges.some(wrapper => wrapper[0] <= range[0] && range[1] <= wrapper[1])) {
+      ranges.push(range)
+    }
+    addCall(name, args)
+  }
+
+  ranges.push(...hy3WrapperRanges)
 
   for (const block of text.matchAll(XML_TOOL_CALL_BLOCK_RE)) {
     const inner = block[1] ?? ''
@@ -1886,10 +2047,7 @@ export function parseXmlToolCalls(text: string): {
 
     if (!name) continue
     ranges.push(range)
-    const dedupKey = `${name}:${JSON.stringify(args)}`
-    if (seen.has(dedupKey)) continue
-    seen.add(dedupKey)
-    results.push({ id: `xml_tc_${++_textToolCallCounter}`, name, arguments: args })
+    addCall(name, args)
   }
 
   return { calls: results, toolCallRanges: ranges }
@@ -2240,8 +2398,28 @@ function convertNonStreamingResponseToAnthropicMessage(
     choice?.message?.content !== '' && choice?.message?.content != null
       ? choice?.message?.content
       : null
-  if (typeof rawContent === 'string' && rawContent) {
-    const strippedContent = stripThinkTags(rawContent)
+  const appendTextOrRecoveredToolCalls = (rawText: string) => {
+    const strippedContent = stripThinkTags(rawText)
+    if (!hasStructuredToolCalls) {
+      const { calls: xmlToolCalls, toolCallRanges } = parseXmlToolCalls(
+        strippedContent,
+        isHy3Model(model),
+      )
+      if (xmlToolCalls.length > 0) {
+        const visibleText = stripRanges(strippedContent, toolCallRanges).trim()
+        if (visibleText) content.push({ type: 'text', text: visibleText })
+        for (const toolCall of xmlToolCalls) {
+          content.push({
+            type: 'tool_use',
+            id: toolCall.id,
+            name: toolCall.name,
+            input: toolCall.arguments,
+          })
+        }
+        return
+      }
+    }
+
     const rawToolCalls = hasStructuredToolCalls
       ? null
       : parseRawToolCallsRequestedText(strippedContent)
@@ -2255,11 +2433,11 @@ function convertNonStreamingResponseToAnthropicMessage(
         })
       }
     } else {
-      content.push({
-        type: 'text',
-        text: strippedContent,
-      })
+      content.push({ type: 'text', text: strippedContent })
     }
+  }
+  if (typeof rawContent === 'string' && rawContent) {
+    appendTextOrRecoveredToolCalls(rawContent)
   } else if (Array.isArray(rawContent) && rawContent.length > 0) {
     const parts: string[] = []
     for (const part of rawContent) {
@@ -2274,25 +2452,7 @@ function convertNonStreamingResponseToAnthropicMessage(
     }
     const joined = parts.join('\n')
     if (joined) {
-      const strippedContent = stripThinkTags(joined)
-      const rawToolCalls = hasStructuredToolCalls
-        ? null
-        : parseRawToolCallsRequestedText(strippedContent)
-      if (rawToolCalls) {
-        for (const toolCall of rawToolCalls) {
-          content.push({
-            type: 'tool_use',
-            id: toolCall.id,
-            name: toolCall.name,
-            input: JSON.parse(toolCall.argumentsJson),
-          })
-        }
-      } else {
-        content.push({
-          type: 'text',
-          text: strippedContent,
-        })
-      }
+      appendTextOrRecoveredToolCalls(joined)
     }
   }
 
@@ -2366,6 +2526,7 @@ async function* openaiStreamToAnthropic(
   requestUrl?: string,
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
+  const allowHy3ToolCalls = isHy3Model(model)
   let contentBlockIndex = 0
   const activeToolCalls = new Map<
     number,
@@ -2770,14 +2931,20 @@ async function* openaiStreamToAnthropic(
             // converted to tool_use blocks at finalize; prose before it streams
             // normally, minus a trailing partial-opener prefix.
             const combined = xmlHoldback + delta.content
-            const openIdx = combined.indexOf(XML_TOOL_CALL_OPEN)
+            const openIdx = findXmlToolCallOpener(
+              combined,
+              allowHy3ToolCalls,
+            )
             if (openIdx !== -1) {
               const before = combined.slice(0, openIdx)
               if (before) yield* emitTextDelta(before)
               xmlHoldback = ''
               xmlToolCallText = combined.slice(openIdx)
             } else {
-              const keep = trailingXmlOpenerPrefixLen(combined)
+              const keep = trailingXmlOpenerPrefixLen(
+                combined,
+                allowHy3ToolCalls,
+              )
               const emit =
                 keep > 0 ? combined.slice(0, combined.length - keep) : combined
               xmlHoldback = keep > 0 ? combined.slice(combined.length - keep) : ''
@@ -3033,7 +3200,10 @@ async function* openaiStreamToAnthropic(
           if (!isOllamaStream && xmlToolCallText !== null) {
             const buffered = xmlToolCallText
             xmlToolCallText = null
-            const { calls, toolCallRanges } = parseXmlToolCalls(buffered)
+            const { calls, toolCallRanges } = parseXmlToolCalls(
+              buffered,
+              allowHy3ToolCalls,
+            )
             if (calls.length > 0) {
               const stripped = stripRanges(buffered, toolCallRanges).trim()
               const strippedVisible = stripThinkTags(stripped).trim()
@@ -3707,7 +3877,7 @@ class OpenAIShimMessages {
       body.max_completion_tokens = maxCompletionTokensValue
     }
 
-    if (params.stream && !isLocalProviderUrl(request.baseUrl)) {
+    if (params.stream && !isLikelyOllamaEndpoint(request.baseUrl)) {
       body.stream_options = { include_usage: true }
     }
 
@@ -3756,6 +3926,7 @@ class OpenAIShimMessages {
       if (reasoningRequestPlan.reasoningEffort) {
         body.reasoning_effort = reasoningRequestPlan.reasoningEffort
       }
+      maybeSetNvidiaNimChatTemplateThinking(body, request.baseUrl, reasoningRequestPlan)
     }
 
     if (reasoningRequestPlan.wireFormat === 'zai_compatible') {
@@ -3769,6 +3940,7 @@ class OpenAIShimMessages {
       } else {
         delete body.reasoning_effort
       }
+      maybeSetNvidiaNimChatTemplateThinking(body, request.baseUrl, reasoningRequestPlan)
     }
 
     // Route/model strip rules are authoritative even when compatibility
@@ -4316,6 +4488,8 @@ class OpenAIShimMessages {
     let requestUrl = buildRequestUrl(activeBaseUrl)
     const attemptedLocalBaseUrls = new Set<string>([activeBaseUrl])
     let didRetryWithoutTools = false
+    let didRetryWithoutToolStream = false
+    let retryCredentialLease: CredentialLease | null = null
     let didRefreshCopilotToken = false
     let refreshedCopilotToken: string | undefined
 
@@ -4420,7 +4594,7 @@ class OpenAIShimMessages {
       ? localRetryBaseUrls.length + 1
       : 0
     const credentialPoolAttempts = credentialPool?.size ?? 1
-    const maxAttempts =
+    let maxAttempts =
       Math.max(isGithub ? GITHUB_429_MAX_RETRIES : 1, credentialPoolAttempts) +
       maxSelfHealAttempts
 
@@ -4506,7 +4680,8 @@ class OpenAIShimMessages {
       : 'openai'
     const { correlationId, startTime } = logApiCallStart(provider, request.resolvedModel)
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const credentialLease = credentialPool?.next() ?? null
+      const credentialLease = retryCredentialLease ?? credentialPool?.next() ?? null
+      retryCredentialLease = null
       if (credentialPool && !credentialLease) {
         throw APIError.generate(
           401,
@@ -4768,6 +4943,36 @@ class OpenAIShimMessages {
 
         logForDebugging(
           `[OpenAIShim] self-heal retry reason=tool_call_incompatible mode=toolless method=POST url=${redactUrlForDiagnostics(requestUrl)} model=${request.resolvedModel}`,
+          { level: 'warn' },
+        )
+        continue
+      }
+
+      // `tool_stream` self-heal (#1950): some OpenAI-compatible gateways (e.g.
+      // NVIDIA NIM) reject the Z.AI-proprietary `tool_stream` parameter with a
+      // 400. Drop only that parameter and retry with tools intact — streaming
+      // tool calls simply aren't streamed on such gateways. This guards against
+      // regressions where the parameter slips through the catalog/runtime
+      // gating that normally suppresses it.
+      if (
+        !didRetryWithoutToolStream &&
+        failure.category === 'tool_stream_unsupported' &&
+        body.tool_stream === true
+      ) {
+        didRetryWithoutToolStream = true
+        // Reserve one additional request only after this specific recovery is
+        // needed. Increasing the shared initial budget changes unrelated
+        // GitHub and credential-pool retry behavior.
+        maxAttempts += 1
+        delete body.tool_stream
+        refreshSerializedBody()
+        // This retry only changes request formatting. Reuse the credential that
+        // received the rejection so a pool with unequal model access cannot
+        // turn a recoverable 400 into an unrelated authorization failure.
+        retryCredentialLease = credentialLease
+
+        logForDebugging(
+          `[OpenAIShim] self-heal retry reason=tool_stream_unsupported method=POST url=${redactUrlForDiagnostics(requestUrl)} model=${request.resolvedModel}`,
           { level: 'warn' },
         )
         continue

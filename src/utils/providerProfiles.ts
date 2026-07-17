@@ -47,6 +47,7 @@ import {
   type ProviderPreset,
 } from '../integrations/index.js'
 import {
+  isCloudflareBaseUrl,
   isClinePassBaseUrl,
   isFireworksBaseUrl,
   isNearaiBaseUrl,
@@ -211,10 +212,33 @@ function resolveProfileCapabilityRouteId(
   provider: string,
   baseUrl?: string,
 ): string {
-  return (
-    resolveRouteIdFromBaseUrl(baseUrl) ??
-    resolveProfileRoute(provider).routeId
-  )
+  const providerRouteId = resolveProfileRoute(provider).routeId
+  if (providerRouteId === 'custom-anthropic') {
+    return providerRouteId
+  }
+
+  const routeIdFromBaseUrl = resolveRouteIdFromBaseUrl(baseUrl)
+  if (routeIdFromBaseUrl) {
+    return routeIdFromBaseUrl
+  }
+
+  // A cloudflare profile retargeted away from the real Workers AI endpoint
+  // (e.g. to gateway.ai.cloudflare.com or another OpenAI-compatible host) is
+  // run generically at runtime — resolveActiveRouteIdFromEnv no longer resolves
+  // it to the cloudflare route. Mirror that boundary here so capability-driven
+  // surfaces (apiFormat, custom auth headers, custom request headers) are not
+  // stripped based on the stale cloudflare route id. Keep the cloudflare route
+  // only when the base URL is the real Workers AI URL (already handled above) or
+  // unset (the descriptor default); any other base URL falls back to generic.
+  if (
+    providerRouteId === 'cloudflare' &&
+    baseUrl &&
+    !isCloudflareBaseUrl(baseUrl)
+  ) {
+    return 'custom'
+  }
+
+  return providerRouteId
 }
 
 function normalizeProfileModelLookupKey(model: string | undefined): string {
@@ -384,6 +408,16 @@ function applySupportedProfileCustomHeaders(
   return customHeaders ? { ...env, ANTHROPIC_CUSTOM_HEADERS: customHeaders } : env
 }
 
+function buildAnthropicCredentialEnv(
+  provider: ProviderProfile['provider'],
+  apiKey: string | undefined,
+): ProfileEnv {
+  if (!apiKey) return {}
+  return provider === 'custom-anthropic'
+    ? { ANTHROPIC_AUTH_TOKEN: apiKey }
+    : { ANTHROPIC_API_KEY: apiKey }
+}
+
 function getModelCacheByProfile(
   profileId: string,
   config = getGlobalConfig(),
@@ -423,7 +457,7 @@ export function getProviderPresetDefaults(
   // Keep preset-pinned endpoints/models even when generic OpenAI env values
   // are present, but still read provider-specific credential env vars above.
   const routeDefaults =
-    preset === 'custom'
+    preset === 'custom' || preset === 'custom-anthropic'
       ? metadata
       : getProviderPresetUiMetadata(preset, {})
   return {
@@ -431,7 +465,13 @@ export function getProviderPresetDefaults(
     name: metadata.name,
     baseUrl: routeDefaults.baseUrl,
     model: routeDefaults.model,
-    apiKey: metadata.apiKey,
+    // The /provider custom Anthropic flow always saves a Bearer token. Keep
+    // direct ANTHROPIC_API_KEY/x-api-key setups out of that field so opening
+    // the preset cannot silently change their authentication scheme.
+    apiKey:
+      preset === 'custom-anthropic'
+        ? process.env.ANTHROPIC_AUTH_TOKEN?.trim() || undefined
+        : metadata.apiKey,
     requiresApiKey: metadata.requiresApiKey,
   }
 }
@@ -478,6 +518,14 @@ function hasCompleteProviderSelection(
   processEnv: NodeJS.ProcessEnv = process.env,
 ): boolean {
   if (resolveEnvOnlyProviderRouteId(processEnv) !== null) return true
+  if (
+    trimOrUndefined(processEnv.ANTHROPIC_BASE_URL) !== undefined &&
+    trimOrUndefined(processEnv.ANTHROPIC_MODEL) !== undefined &&
+    (trimOrUndefined(processEnv.ANTHROPIC_AUTH_TOKEN) !== undefined ||
+      trimOrUndefined(processEnv.ANTHROPIC_API_KEY) !== undefined)
+  ) {
+    return true
+  }
   if (!hasProviderSelectionFlags(processEnv)) return false
   if (processEnv.CLAUDE_CODE_USE_OPENAI !== undefined) {
     return (
@@ -570,7 +618,9 @@ function isProcessEnvAlignedWithProfile(
       sameOptionalEnvValue(processEnv.ANTHROPIC_BASE_URL, profile.baseUrl) &&
       sameOptionalEnvValue(processEnv.ANTHROPIC_MODEL, primaryModel) &&
       (!includeApiKey ||
-        sameOptionalEnvValue(processEnv.ANTHROPIC_API_KEY, profile.apiKey))
+        (profile.provider === 'custom-anthropic'
+          ? sameOptionalEnvValue(processEnv.ANTHROPIC_AUTH_TOKEN, profile.apiKey)
+          : sameOptionalEnvValue(processEnv.ANTHROPIC_API_KEY, profile.apiKey)))
     )
   }
 
@@ -721,6 +771,10 @@ function isProcessEnvAlignedWithProfile(
     (isFireworksBaseUrl(profile.baseUrl)
       ? !includeApiKey ||
         sameOptionalEnvValue(processEnv.FIREWORKS_API_KEY, profile.apiKey)
+      : true) &&
+    (isCloudflareBaseUrl(profile.baseUrl)
+      ? !includeApiKey ||
+        sameOptionalEnvValue(processEnv.CLOUDFLARE_API_TOKEN, profile.apiKey)
       : true)
   )
 }
@@ -813,7 +867,7 @@ export function applyProviderProfileToProcessEnv(
       profileEnv = {
         ANTHROPIC_BASE_URL: profile.baseUrl,
         ANTHROPIC_MODEL: primaryModel,
-        ...(profile.apiKey ? { ANTHROPIC_API_KEY: profile.apiKey } : {}),
+        ...buildAnthropicCredentialEnv(profile.provider, profile.apiKey),
       }
     }
   } else if (compatibilityMode === 'mistral') {
@@ -924,6 +978,19 @@ export function applyProviderProfileToProcessEnv(
       }
       if (route.routeId === 'fireworks' || isFireworksBaseUrl(profile.baseUrl)) {
         openAIProfileEnv.FIREWORKS_API_KEY = profile.apiKey
+      }
+      // Gate on the Workers AI path predicate (isCloudflareBaseUrl: exact
+      // api.cloudflare.com host AND the `/client/v4/accounts/<id>/ai/v1` path),
+      // not the saved route id and not the host alone. A cloudflare profile
+      // retargeted to the shared gateway.ai.cloudflare.com AI Gateway host, or
+      // to a non-Workers api.cloudflare.com REST path, keeps
+      // routeId === 'cloudflare' yet is not a Workers AI endpoint — mirroring
+      // CLOUDFLARE_API_TOKEN on the route id (or on host alone) would leak the
+      // token to it. The sibling sites (isProcessEnvAlignedWithProfile,
+      // buildOpenAICompatibleStartupEnv) key on the same isCloudflareBaseUrl
+      // path predicate.
+      if (isCloudflareBaseUrl(profile.baseUrl)) {
+        openAIProfileEnv.CLOUDFLARE_API_TOKEN = profile.apiKey
       }
     }
     if (isAimlapiProfile) {
@@ -1147,7 +1214,7 @@ export function updateProviderProfile(
   }
 
   if (shouldApply) {
-    applyProviderProfileToProcessEnv(updatedProfile)
+    setActiveProviderProfile(profileId)
   }
 
   return updatedProfile
@@ -1252,6 +1319,16 @@ function buildOpenAICompatibleStartupEnv(
       if (isFireworksBaseUrl(activeProfile.baseUrl)) {
         strictEnv.FIREWORKS_API_KEY = activeProfile.apiKey
       }
+      // Cloudflare's transport reads the dedicated CLOUDFLARE_API_TOKEN; mirror
+      // it like nearai/fireworks, but only when the base URL is a real Workers
+      // AI endpoint per the isCloudflareBaseUrl path predicate (exact
+      // api.cloudflare.com host AND the `/client/v4/accounts/<id>/ai/v1` path),
+      // so a keyed Cloudflare profile's persisted startup env stays consistent
+      // and re-detects correctly after relaunch without persisting the token
+      // for a non-Workers api.cloudflare.com path or the shared AI Gateway host.
+      if (isCloudflareBaseUrl(activeProfile.baseUrl)) {
+        strictEnv.CLOUDFLARE_API_TOKEN = activeProfile.apiKey
+      }
       return applySupportedProfileCustomHeaders(activeProfile, strictEnv)
     }
   }
@@ -1307,6 +1384,16 @@ function buildOpenAICompatibleStartupEnv(
     if (isFireworksBaseUrl(activeProfile.baseUrl)) {
       env.FIREWORKS_API_KEY = activeProfile.apiKey
     }
+    // Cloudflare Workers AI authenticates over the generic OpenAI-compatible
+    // header, so mirror the saved key into CLOUDFLARE_API_TOKEN only when the
+    // endpoint is the real Workers AI route: api.cloudflare.com with the
+    // /client/v4/accounts/<id>/ai/v1 path over HTTPS (isCloudflareBaseUrl).
+    // Non-Workers api.cloudflare.com paths and the shared AI Gateway host
+    // (gateway.ai.cloudflare.com) are excluded — they proxy arbitrary
+    // providers (#1100 review).
+    if (isCloudflareBaseUrl(activeProfile.baseUrl)) {
+      env.CLOUDFLARE_API_TOKEN = activeProfile.apiKey
+    }
   } else {
     delete env.OPENAI_API_KEY
   }
@@ -1340,9 +1427,10 @@ function buildStartupProfileFromActiveProfile(
         env: applySupportedProfileCustomHeaders(activeProfile, {
           ANTHROPIC_BASE_URL: activeProfile.baseUrl,
           ANTHROPIC_MODEL: getPrimaryModel(activeProfile.model),
-          ...(activeProfile.apiKey
-            ? { ANTHROPIC_API_KEY: activeProfile.apiKey }
-            : {}),
+          ...buildAnthropicCredentialEnv(
+            activeProfile.provider,
+            activeProfile.apiKey,
+          ),
         }),
       }
     case 'gemini': {
@@ -1568,6 +1656,7 @@ export function deleteProviderProfile(profileId: string): {
   let removed = false
   let deletedProfile: ProviderProfile | undefined
   let nextActiveProfile: ProviderProfile | undefined
+  let activeProfileWasDeleted = false
 
   saveGlobalConfig(current => {
     const currentProfiles = getProviderProfiles(current)
@@ -1590,6 +1679,7 @@ export function deleteProviderProfile(profileId: string): {
       currentActive === profileId ||
       (currentActive !== ANTHROPIC_DEFAULT_PROFILE_ID &&
         !nextProfiles.some(profile => profile.id === currentActive))
+    activeProfileWasDeleted = activeWasDeleted
 
     const nextActiveId = activeWasDeleted ? nextProfiles[0]?.id : currentActive
 
@@ -1624,14 +1714,16 @@ export function deleteProviderProfile(profileId: string): {
   })
 
   if (nextActiveProfile) {
-    applyProviderProfileToProcessEnv(nextActiveProfile)
-  } else if (
-    deletedProfile &&
-    isProcessEnvAlignedWithProfile(process.env, deletedProfile, {
-      includeApiKey: false,
-    })
-  ) {
-    clearProviderProfileEnvFromProcessEnv()
+    setActiveProviderProfile(nextActiveProfile.id)
+  } else if (deletedProfile && activeProfileWasDeleted) {
+    if (
+      isProcessEnvAlignedWithProfile(process.env, deletedProfile, {
+        includeApiKey: false,
+      })
+    ) {
+      clearProviderProfileEnvFromProcessEnv()
+    }
+    deleteProfileFile()
   }
 
   return {

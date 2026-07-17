@@ -23,13 +23,19 @@ import { getModelStrings, resolveOverriddenModel } from './modelStrings.js'
 import { formatModelPricing, getOpus46CostTier } from '../modelCost.js'
 import { getSettings_DEPRECATED } from '../settings/settings.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
-import { getAPIProvider } from './providers.js'
+import {
+  getAPIProvider,
+  isFirstPartyAnthropicBaseUrl,
+  isFirstPartyAnthropicProvider,
+  isCustomAnthropicProvider,
+} from './providers.js'
 import { LIGHTNING_BOLT } from '../../constants/figures.js'
 import { isModelAllowed } from './modelAllowlist.js'
 import { type ModelAlias, isModelAlias } from './aliases.js'
 import { capitalize } from '../stringUtils.js'
 import { DEFAULT_GEMINI_MODEL } from '../providerProfile.js'
 import { getAntModelOverrideConfig, resolveAntModel } from './antModels.js'
+import { getRouteDefaultModel } from '../../integrations/routeMetadata.js'
 
 export type ModelShortName = string
 export type ModelName = string
@@ -47,6 +53,9 @@ function normalizeModelSetting(value: unknown): ModelName | ModelAlias | undefin
 
 export function getSmallFastModel(): ModelName {
   if (process.env.ANTHROPIC_SMALL_FAST_MODEL) return process.env.ANTHROPIC_SMALL_FAST_MODEL
+  if (isCustomAnthropicProvider()) {
+    return process.env.ANTHROPIC_MODEL || getDefaultHaikuModel()
+  }
   // For Gemini provider, use a fast model
   if (getAPIProvider() === 'gemini') {
     return process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'
@@ -225,7 +234,7 @@ export function getDefaultOpusModel(): ModelName {
   // 3P providers (Bedrock, Vertex, Foundry) — kept as a separate branch
   // since 3P availability lags firstParty and these will diverge again at
   // the next model launch. Keep 3P on Opus 4.7 until they roll out 4.8.
-  if (getAPIProvider() !== 'firstParty') {
+  if (!isFirstPartyAnthropicProvider()) {
     return getModelStrings().opus47
   }
   return getModelStrings().opus48
@@ -273,7 +282,7 @@ export function getDefaultSonnetModel(): ModelName {
     return process.env.OPENAI_MODEL || 'grok-4.3'
   }
   // Default to Sonnet 4.5 for 3P since they may not have 4.6 yet
-  if (getAPIProvider() !== 'firstParty') {
+  if (!isFirstPartyAnthropicProvider()) {
     return getModelStrings().sonnet45
   }
   return getModelStrings().sonnet46
@@ -364,6 +373,12 @@ export function getRuntimeMainLoopModel(params: {
  * @returns The default model setting to use
  */
 export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
+  // Custom Anthropic-compatible endpoints intentionally retain the legacy
+  // firstParty provider category, so prefer their explicitly configured model
+  // before the subscription and PAYG defaults below.
+  if (isCustomAnthropicProvider()) {
+    return process.env.ANTHROPIC_MODEL || getDefaultSonnetModel()
+  }
   // GitHub Copilot provider: check settings.model first, then env, then default
   if (getAPIProvider() === 'github') {
     const settings = getSettings_DEPRECATED() || {}
@@ -387,6 +402,15 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
   // Codex provider: always use the configured Codex model (default gpt-5.5)
   if (getAPIProvider() === 'codex') {
     return process.env.OPENAI_MODEL || 'gpt-5.5'
+  }
+  // NVIDIA NIM uses OpenAI-compatible model ids. Keep this fallback aligned
+  // with the route descriptor so headless sessions never send a Claude model.
+  if (getAPIProvider() === 'nvidia-nim') {
+    return (
+      process.env.OPENAI_MODEL ||
+      getRouteDefaultModel('nvidia-nim') ||
+      'nvidia/llama-3.1-nemotron-70b-instruct'
+    )
   }
   // xAI provider: always use the configured Grok model (default grok-4.3)
   if (getAPIProvider() === 'xai') {
@@ -539,7 +563,7 @@ export function renderDefaultModelSetting(
 }
 
 export function getOpus46PricingSuffix(fastMode: boolean): string {
-  if (getAPIProvider() !== 'firstParty') return ''
+  if (!isFirstPartyAnthropicProvider()) return ''
   const pricing = formatModelPricing(getOpus46CostTier(fastMode))
   const fastModeIndicator = fastMode ? ` (${LIGHTNING_BOLT})` : ''
   return ` ·${fastModeIndicator} ${pricing}`
@@ -549,7 +573,7 @@ export function isOpus1mMergeEnabled(): boolean {
   if (
     is1mContextDisabled() ||
     isProSubscriber() ||
-    getAPIProvider() !== 'firstParty'
+    !isFirstPartyAnthropicProvider()
   ) {
     return false
   }
@@ -815,6 +839,7 @@ export function parseUserSpecifiedModel(
   // 3P providers may not yet have 4.6 capacity, so pass through unchanged.
   if (
     getAPIProvider() === 'firstParty' &&
+    isFirstPartyAnthropicBaseUrl() &&
     isLegacyOpusFirstParty(modelString) &&
     isLegacyModelRemapEnabled()
   ) {
@@ -899,7 +924,7 @@ export function isLegacyModelRemapEnabled(): boolean {
 
 export function modelDisplayString(model: ModelSetting): string {
   if (model === null) {
-    if (getAPIProvider() !== 'firstParty') {
+    if (!isFirstPartyAnthropicProvider()) {
       return `Default (${getDefaultMainLoopModel()})`
     }
     if (process.env.USER_TYPE === 'ant') {

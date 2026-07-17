@@ -202,6 +202,9 @@ test('deep-link protocol resolver uses openclaude launcher for OpenClaude packag
 test('install command repairs launcher after npm cleanup before final check', async () => {
   const calls: string[] = []
   let repairCompleted = false
+  ;(globalThis as Record<string, unknown>).MACRO = {
+    PACKAGE_URL: '@makerbi/openclaude',
+  }
 
   const stdout = new PassThrough()
   const stdin = new PassThrough() as PassThrough & {
