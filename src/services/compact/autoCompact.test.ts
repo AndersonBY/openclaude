@@ -23,8 +23,15 @@ const realErrors = await import(
 const realTokens = await import(
   `../../utils/tokens.js?real=${Date.now()}-${Math.random()}`
 )
+const realCompact = await import(
+  `./compact.js?real=${Date.now()}-${Math.random()}`
+)
+const realSessionMemoryCompact = await import(
+  `./sessionMemoryCompact.js?real=${Date.now()}-${Math.random()}`
+)
 
 const USER_ABORT_MESSAGE = 'API Error: Request was aborted.'
+let hasSharedMutationLock = false
 
 type ImportAutoCompactOptions = {
   compactConversation?: ReturnType<typeof mock>
@@ -105,19 +112,38 @@ function restoreEnv(): void {
 
 beforeEach(async () => {
   await acquireSharedMutationLock('services/compact/autoCompact.test.ts')
-  delete process.env.DISABLE_COMPACT
-  delete process.env.DISABLE_AUTO_COMPACT
-  delete process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS
-  delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
-  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+  hasSharedMutationLock = true
+  try {
+    delete process.env.DISABLE_COMPACT
+    delete process.env.DISABLE_AUTO_COMPACT
+    delete process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS
+    delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+    delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+  } catch (error) {
+    releaseSharedMutationLock()
+    hasSharedMutationLock = false
+    throw error
+  }
 })
 
-afterEach(() => {
+afterEach(async () => {
+  if (!hasSharedMutationLock) {
+    return
+  }
   try {
     mock.restore()
     restoreEnv()
+    mock.module('../../utils/context.js', () => ({ ...realContext }))
+    mock.module('../../utils/errors.js', () => ({ ...realErrors }))
+    mock.module('../../utils/tokens.js', () => ({ ...realTokens }))
+    mock.module('../../utils/config.js', () => ({ ...realConfig }))
+    mock.module('./compact.js', () => ({ ...realCompact }))
+    mock.module('./sessionMemoryCompact.js', () => ({
+      ...realSessionMemoryCompact,
+    }))
   } finally {
     releaseSharedMutationLock()
+    hasSharedMutationLock = false
   }
 })
 
